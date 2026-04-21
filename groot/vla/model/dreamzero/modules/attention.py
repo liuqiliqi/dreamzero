@@ -133,22 +133,40 @@ def flash_attention(
             causal=causal,
             deterministic=deterministic)[0].unflatten(0, (b, lq))
     else:
-        assert FLASH_ATTN_2_AVAILABLE
-        x = flash_attn.flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(
-                0, dtype=torch.int32).to(q.device, non_blocking=True),
-            cu_seqlens_k=torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(
-                0, dtype=torch.int32).to(q.device, non_blocking=True),
-            max_seqlen_q=lq,
-            max_seqlen_k=lk,
-            dropout_p=dropout_p,
-            softmax_scale=softmax_scale,
-            causal=causal,
-            window_size=window_size,
-            deterministic=deterministic).unflatten(0, (b, lq))
+        if FLASH_ATTN_2_AVAILABLE:
+            x = flash_attn.flash_attn_varlen_func(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=torch.cat([q_lens.new_zeros([1]), q_lens]).cumsum(
+                    0, dtype=torch.int32).to(q.device, non_blocking=True),
+                cu_seqlens_k=torch.cat([k_lens.new_zeros([1]), k_lens]).cumsum(
+                    0, dtype=torch.int32).to(q.device, non_blocking=True),
+                max_seqlen_q=lq,
+                max_seqlen_k=lk,
+                dropout_p=dropout_p,
+                softmax_scale=softmax_scale,
+                causal=causal,
+                window_size=window_size,
+                deterministic=deterministic).unflatten(0, (b, lq))
+        else:
+            # Fallback to PyTorch SDPA when flash_attn is not installed.
+            # q/k/v are already flattened to (B*L, N, C); unflatten back to (B, L, N, C).
+            warnings.warn(
+                'flash_attn not available, falling back to torch scaled_dot_product_attention.'
+            )
+            q = q.unflatten(0, (b, lq))   # (B, Lq, N, C)
+            k = k.unflatten(0, (b, lk))   # (B, Lk, N, C)
+            v = v.unflatten(0, (b, lk))
+            # SDPA expects (B, N, L, C)
+            q = q.transpose(1, 2)
+            k = k.transpose(1, 2)
+            v = v.transpose(1, 2)
+            x = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, is_causal=causal,
+                dropout_p=dropout_p, scale=softmax_scale,
+            )
+            x = x.transpose(1, 2)  # back to (B, L, N, C)
 
     # output
     return x.type(out_dtype)

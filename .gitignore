@@ -243,3 +243,12 @@ groot/control/envs/yam/data/eval/*
 /data
 
 checkpoints/
+# Media / large artifacts (added 2026-04)
+*.mp4
+*.safetensors
+*.pth
+*.pt
+*.npz
+*.npy
+profile_output*/
+logs/

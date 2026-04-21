@@ -322,7 +322,9 @@ class GrootSimPolicy(BaseGrootSimPolicy):
         try:
             model.parallelize(device_mesh=device_mesh)
         except Exception as e:
-            print("Skipping parallelization")
+            print(f"Skipping parallelization: {e}")
+            import traceback
+            traceback.print_exc()
 
         torch.cuda.empty_cache()
 

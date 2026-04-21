@@ -2,6 +2,7 @@
 import math
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
 import os
 from diffusers.configuration_utils import ConfigMixin, register_to_config
@@ -200,6 +201,11 @@ class WanSelfAttention(nn.Module):
         self.window_size = window_size
         self.qk_norm = qk_norm
         self.eps = eps
+        # tensor parallelism (defaults for no TP)
+        self.tp_size = 1
+        self.tp_rank = 0
+        self.tp_group = None
+        self._full_num_heads = num_heads
 
         # layers
         self.q = nn.Linear(dim, dim)
@@ -208,6 +214,60 @@ class WanSelfAttention(nn.Module):
         self.o = nn.Linear(dim, dim)
         self.norm_q = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
+
+    def _all_reduce(self, tensor, group=None):
+        """All-reduce hook point for PCG. Can be replaced at instance level."""
+        dist.all_reduce(tensor, group=group)
+
+    def _tp_qkv(self, x, b, s):
+        """Compute Q/K/V with optional TP head slicing."""
+        n, d = self.num_heads, self.head_dim
+        if self.tp_size > 1:
+            full_n = self._full_num_heads
+            hs = self.tp_rank * n
+            he = hs + n
+            q = self.norm_q(self.q(x)).view(b, s, full_n, d)[:, :, hs:he, :].contiguous()
+            k = self.norm_k(self.k(x)).view(b, s, full_n, d)[:, :, hs:he, :].contiguous()
+            v = self.v(x).view(b, s, full_n, d)[:, :, hs:he, :].contiguous()
+        else:
+            q = self.norm_q(self.q(x)).view(b, s, n, d)
+            k = self.norm_k(self.k(x)).view(b, s, n, d)
+            v = self.v(x).view(b, s, n, d)
+        return q, k, v
+
+    def _tp_output(self, x):
+        """Apply O-proj with optional TP all-reduce."""
+        x = x.flatten(2)
+        x = self.o(x)
+        if self.tp_size > 1:
+            self._all_reduce(x, group=self.tp_group)
+        return x
+
+    def parallelize_tp(self, tp_mesh) -> None:
+        """Apply tensor parallelism: shard attention heads across TP ranks."""
+        self.tp_rank = tp_mesh.get_local_rank()
+        self.tp_size = tp_mesh.size()
+        self.tp_group = tp_mesh.get_group()
+
+        assert self.num_heads % self.tp_size == 0, \
+            f"num_heads={self.num_heads} must be divisible by tp_size={self.tp_size}"
+
+        local_num_heads = self.num_heads // self.tp_size
+        head_start = self.tp_rank * local_num_heads
+        head_end = head_start + local_num_heads
+
+        # Shard O-proj row-parallel
+        w_o = self.o.weight.data
+        w_o_heads = w_o.view(self.dim, self.num_heads, self.head_dim)
+        w_o_local = w_o_heads[:, head_start:head_end, :].reshape(self.dim, local_num_heads * self.head_dim).contiguous()
+        self.o.weight = nn.Parameter(w_o_local)
+        self.o.in_features = local_num_heads * self.head_dim
+        # Only rank 0 keeps O-proj bias to avoid double-counting after all-reduce
+        if self.o.bias is not None and self.tp_rank != 0:
+            self.o.bias = nn.Parameter(torch.zeros_like(self.o.bias))
+
+        self._full_num_heads = self.num_heads
+        self.num_heads = local_num_heads
 
     def forward(self, x, seq_lens, freqs):
         r"""
@@ -242,6 +302,19 @@ class WanSelfAttention(nn.Module):
 
 class WanT2VCrossAttention(WanSelfAttention):
 
+    def _tp_slice_kv(self, k_full, v_full, b, n, d):
+        """Slice K/V heads for TP (after norm+reshape with full heads)."""
+        if self.tp_size > 1:
+            full_n = self._full_num_heads
+            hs = self.tp_rank * n
+            he = hs + n
+            k = k_full.view(b, -1, full_n, d)[:, :, hs:he, :].contiguous()
+            v = v_full.view(b, -1, full_n, d)[:, :, hs:he, :].contiguous()
+        else:
+            k = k_full.view(b, -1, n, d)
+            v = v_full.view(b, -1, n, d)
+        return k, v
+
     def forward(self, x, context, context_lens, crossattn_cache=None):
         r"""
         Args:
@@ -252,30 +325,34 @@ class WanT2VCrossAttention(WanSelfAttention):
         """
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
-        # compute query, key, value
-        q = self.norm_q(self.q(x)).view(b, -1, n, d)
+        # compute query
+        if self.tp_size > 1:
+            full_n = self._full_num_heads
+            hs = self.tp_rank * n
+            he = hs + n
+            q = self.norm_q(self.q(x)).view(b, -1, full_n, d)[:, :, hs:he, :].contiguous()
+        else:
+            q = self.norm_q(self.q(x)).view(b, -1, n, d)
 
         if crossattn_cache is not None:
             if not crossattn_cache["is_init"]:
                 crossattn_cache["is_init"] = True
-                k = self.norm_k(self.k(context)).view(b, -1, n, d)
-                v = self.v(context).view(b, -1, n, d)
+                k, v = self._tp_slice_kv(
+                    self.norm_k(self.k(context)), self.v(context), b, n, d)
                 crossattn_cache["k"] = k
                 crossattn_cache["v"] = v
             else:
                 k = crossattn_cache["k"]
                 v = crossattn_cache["v"]
         else:
-            k = self.norm_k(self.k(context)).view(b, -1, n, d)
-            v = self.v(context).view(b, -1, n, d)
+            k, v = self._tp_slice_kv(
+                self.norm_k(self.k(context)), self.v(context), b, n, d)
 
         # compute attention
         x = flash_attention(q, k, v, k_lens=context_lens)
 
         # output
-        x = x.flatten(2)
-        x = self.o(x)
-        return x
+        return self._tp_output(x)
 
 
 class WanGanCrossAttention(WanSelfAttention):
@@ -321,6 +398,11 @@ class WanI2VCrossAttention(WanSelfAttention):
         self.norm_k_img = WanRMSNorm(
             dim, eps=eps) if qk_norm else nn.Identity()
 
+    def parallelize_tp(self, tp_mesh) -> None:
+        """TP for I2V cross-attention: also handles k_img/v_img projections."""
+        super().parallelize_tp(tp_mesh)
+        # k_img/v_img stay replicated (heads sliced in forward)
+
     def forward(self, x, context, crossattn_cache=None):
         r"""
         Args:
@@ -331,26 +413,44 @@ class WanI2VCrossAttention(WanSelfAttention):
         context = context[:, 257:]
         b, n, d = x.size(0), self.num_heads, self.head_dim
 
-        q = self.norm_q(self.q(x)).view(b, -1, n, d)
+        # compute query with TP head slicing
+        if self.tp_size > 1:
+            full_n = self._full_num_heads
+            hs = self.tp_rank * n
+            he = hs + n
+            q = self.norm_q(self.q(x)).view(b, -1, full_n, d)[:, :, hs:he, :].contiguous()
+        else:
+            q = self.norm_q(self.q(x)).view(b, -1, n, d)
 
-        if crossattn_cache is not None: 
+        if crossattn_cache is not None:
             if not crossattn_cache["is_init"]:
                 crossattn_cache["is_init"] = True
-                k = self.norm_k(self.k(context)).view(b, -1, n, d)
-                v = self.v(context).view(b, -1, n, d)
+                if self.tp_size > 1:
+                    k = self.norm_k(self.k(context)).view(b, -1, full_n, d)[:, :, hs:he, :].contiguous()
+                    v = self.v(context).view(b, -1, full_n, d)[:, :, hs:he, :].contiguous()
+                else:
+                    k = self.norm_k(self.k(context)).view(b, -1, n, d)
+                    v = self.v(context).view(b, -1, n, d)
                 crossattn_cache["k"] = k
                 crossattn_cache["v"] = v
-            else: 
+            else:
                 k = crossattn_cache["k"]
-                v = crossattn_cache["v"] 
-        else: 
-            # compute query, key, value   
-            k = self.norm_k(self.k(context)).view(b, -1, n, d)
-            v = self.v(context).view(b, -1, n, d)
+                v = crossattn_cache["v"]
+        else:
+            if self.tp_size > 1:
+                k = self.norm_k(self.k(context)).view(b, -1, full_n, d)[:, :, hs:he, :].contiguous()
+                v = self.v(context).view(b, -1, full_n, d)[:, :, hs:he, :].contiguous()
+            else:
+                k = self.norm_k(self.k(context)).view(b, -1, n, d)
+                v = self.v(context).view(b, -1, n, d)
         x = flash_attention(q, k, v, k_lens=None)
 
-        k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
-        v_img = self.v_img(context_img).view(b, -1, n, d)
+        if self.tp_size > 1:
+            k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, full_n, d)[:, :, hs:he, :].contiguous()
+            v_img = self.v_img(context_img).view(b, -1, full_n, d)[:, :, hs:he, :].contiguous()
+        else:
+            k_img = self.norm_k_img(self.k_img(context_img)).view(b, -1, n, d)
+            v_img = self.v_img(context_img).view(b, -1, n, d)
         img_x = flash_attention(q, k_img, v_img, k_lens=None)
 
         # output
@@ -358,6 +458,8 @@ class WanI2VCrossAttention(WanSelfAttention):
         img_x = img_x.flatten(2)
         x = x + img_x
         x = self.o(x)
+        if self.tp_size > 1:
+            self._all_reduce(x, group=self.tp_group)
         return x
 
 

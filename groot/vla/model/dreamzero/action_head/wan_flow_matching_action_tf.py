@@ -51,6 +51,67 @@ from groot.vla.model.dreamzero.modules.flow_unipc_multistep_scheduler import Flo
 
 KVCacheType: TypeAlias = torch.Tensor
 
+
+class FP8Linear(nn.Module):
+    """Drop-in replacement for nn.Linear that uses FP8 matmul via torch._scaled_mm."""
+
+    def __init__(self, weight: torch.Tensor, bias: torch.Tensor | None):
+        super().__init__()
+        self.fp8_dtype = torch.float8_e4m3fn
+        w_max = weight.abs().amax()
+        self.w_scale = nn.Parameter(
+            (w_max / 448.0).clamp(min=1e-12).float().reshape(1, 1),
+            requires_grad=False,
+        )
+        self.weight_fp8 = nn.Parameter(
+            (weight.float() / self.w_scale.flatten()).clamp(-448.0, 448.0).to(self.fp8_dtype),
+            requires_grad=False,
+        )
+        self.bias = nn.Parameter(bias.to(torch.bfloat16), requires_grad=False) if bias is not None else None
+        self.out_features, self.in_features = weight.shape
+
+    @torch.compiler.disable
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        origin_dtype = x.dtype
+        origin_shape = x.shape
+        x_flat = x.reshape(-1, origin_shape[-1])
+
+        # Per-tensor scaling for activation
+        x_max = x_flat.abs().amax().float()
+        a_scale = (x_max / 448.0).clamp(min=1e-12).reshape(1, 1)
+        x_fp8 = (x_flat.float() / a_scale.flatten()).clamp(-448.0, 448.0).to(self.fp8_dtype)
+
+        result = torch._scaled_mm(
+            x_fp8,
+            self.weight_fp8.T,
+            scale_a=a_scale,
+            scale_b=self.w_scale,
+            bias=self.bias,
+            out_dtype=origin_dtype,
+        )
+        return result.reshape(origin_shape[:-1] + (self.out_features,))
+
+
+def convert_model_to_fp8(model: nn.Module, skip_names: tuple[str, ...] = ()) -> int:
+    """Replace all nn.Linear in model with FP8Linear. Returns number replaced."""
+    count = 0
+    for name, module in list(model.named_modules()):
+        if not isinstance(module, nn.Linear):
+            continue
+        # Skip small layers (embeddings etc.) and explicitly excluded names
+        if any(s in name for s in skip_names):
+            continue
+        # Navigate to parent module
+        parts = name.split(".")
+        parent = model
+        for p in parts[:-1]:
+            parent = getattr(parent, p)
+        fp8_layer = FP8Linear(module.weight.data, module.bias.data if module.bias is not None else None)
+        setattr(parent, parts[-1], fp8_layer)
+        count += 1
+    return count
+
+
 @dataclass
 class WANPolicyHeadConfig(PretrainedConfig):
     add_pos_embed: bool = field(
@@ -172,7 +233,7 @@ class WANPolicyHead(ActionHead):
         self.scheduler = FlowMatchScheduler(shift=5, sigma_min=0.0, extra_one_step=True)
         self.model_names = ['text_encoder']
 
-        self.num_inference_steps = 16 
+        self.num_inference_steps = int(os.getenv("NUM_INFERENCE_STEPS", "16"))
         self.seed = 1140
         self.cfg_scale = 5.0
         self.denoising_strength = 1.0
@@ -201,21 +262,11 @@ class WANPolicyHead(ActionHead):
         self._device = "cuda"
         self.dynamic_cache_schedule = os.getenv("DYNAMIC_CACHE_SCHEDULE", "False").lower() == "true"
 
-
-        num_dit_steps = 8
-        if os.getenv("NUM_DIT_STEPS") is not None:
-            num_dit_steps = int(os.getenv("NUM_DIT_STEPS"))
-        if num_dit_steps == 5:
-            self.dit_step_mask = [True, True, True, False, False, False, False, True, False, False, False, False, True, False, False, False]
-        elif num_dit_steps == 6:
-            self.dit_step_mask = [True, True, False, False, False, True, False, False, False, False, True, False, False, False, True, True]
-        elif num_dit_steps == 7:
-            self.dit_step_mask = [True, True, True, False, False, False, True, False, False, False, True, False, False, False, True, True]
-        elif num_dit_steps == 8:
-            self.dit_step_mask = [True, True, True, False, False, False, True, False, False, False, True, False, False, True, True, True]
-        else:
-            self.dit_step_mask = [True, True, True, True, True, True, True, True, True, True, True, True, True, True, True, True]
-        assert self.dit_step_mask[0] == True, "first step must be True"
+        # DiT caching: NUM_DIT_STEPS controls how many actual DiT forward passes to run.
+        # The mask is generated dynamically in _build_dit_step_mask() based on num_inference_steps.
+        self.num_dit_steps = int(os.getenv("NUM_DIT_STEPS", "0"))  # 0 = no caching (all steps computed)
+        # Cache extrapolation: use linear extrapolation instead of simple reuse
+        self.cache_extrapolate = os.getenv("DIT_CACHE_EXTRAPOLATE", "True").lower() == "true"
 
         self.normalize_video = v2.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
 
@@ -480,14 +531,20 @@ class WANPolicyHead(ActionHead):
         """
         Initialize a Per-GPU KV cache for the Wan model.
         """
+        num_heads = self.model.num_heads
+        head_dim = self.model.dim // self.model._full_num_heads if hasattr(self.model, '_full_num_heads') else self.model.dim // num_heads
+        # After TP, self.model.blocks[i].self_attn.num_heads is the local head count
+        if len(self.model.blocks) > 0:
+            num_heads = self.model.blocks[0].self_attn.num_heads
+            head_dim = self.model.blocks[0].self_attn.head_dim
         kv_cache1: KVCacheType = []
         kv_cache_neg: KVCacheType = []
         for _ in range(self.model.num_layers):
             kv_cache1.append(
-               torch.zeros([2, batch_size, 0, 40, 128], dtype=dtype, device=device),
+               torch.zeros([2, batch_size, 0, num_heads, head_dim], dtype=dtype, device=device),
             )
             kv_cache_neg.append(
-                torch.zeros([2, batch_size, 0, 40, 128], dtype=dtype, device=device),
+                torch.zeros([2, batch_size, 0, num_heads, head_dim], dtype=dtype, device=device),
             )
 
         return kv_cache1, kv_cache_neg
@@ -498,19 +555,153 @@ class WANPolicyHead(ActionHead):
         """
         Initialize a Per-GPU cross-attention cache for the Wan model.
         """
+        num_heads = self.model.num_heads
+        head_dim = self.model.dim // self.model._full_num_heads if hasattr(self.model, '_full_num_heads') else self.model.dim // num_heads
+        if len(self.model.blocks) > 0:
+            num_heads = self.model.blocks[0].cross_attn.num_heads
+            head_dim = self.model.blocks[0].cross_attn.head_dim
         crossattn_cache: KVCacheType = []
         crossattn_cache_neg: KVCacheType = []
 
         for _ in range(self.model.num_layers):
             crossattn_cache.append(
-                torch.zeros([2, batch_size, 512, 40, 128], dtype=dtype, device=device),
+                torch.zeros([2, batch_size, 512, num_heads, head_dim], dtype=dtype, device=device),
             )
             crossattn_cache_neg.append(
-                torch.zeros([2, batch_size, 512, 40, 128], dtype=dtype, device=device),
+                torch.zeros([2, batch_size, 512, num_heads, head_dim], dtype=dtype, device=device),
             )
 
         return crossattn_cache, crossattn_cache_neg
-        
+
+    def _slide_kv_window(self, window_size: int = 2):
+        """
+        Sliding window KV cache with RoPE position-shift re-encoding and
+        optional sink-token preservation (StreamingLLM style).
+
+        Cache layout after slide:
+            [sink frames at pos 0..sink_size-1] + [recent frames re-roped to
+             pos sink_size..kept_total-1]
+        Sink frames keep their original baked-in RoPE (pos 0..sink_size-1).
+        Recent frames get rotated by conj(freqs[0][shift]) to bring their
+        frame-axis position down to [sink_size..kept_total-1]. Next prefill
+        writes at [kept_total..kept_total+npfb-1] monotonically.
+
+        The sink preserves the model's "task anchor" (pos 0 = initial
+        observation encoded by init-diffusion), which training always saw as
+        the starting frame. Without sink, pos 0 gets overwritten every slide
+        and the model loses the absolute reference — robot forgets where it
+        started and tends to repeat pick/place cycles.
+
+        Env vars:
+            KV_SINK_SIZE (default 1) — number of leading frames preserved.
+            kept_total = window_size * npfb, split into sink + recent.
+
+        In-distribution constraint: kept_total + 2*npfb - 1 <= local_attn_size - 1
+        (i.e. kept_total <= 5 for local_attn=9, npfb=2).
+        """
+        if self.kv_cache1 is None:
+            return
+
+        frame_seqlen = self.model.blocks[0].self_attn.frame_seqlen if hasattr(self.model.blocks[0].self_attn, 'frame_seqlen') else 880
+        npfb = self.num_frame_per_block
+        sink_size = int(os.environ.get("KV_SINK_SIZE", "1"))
+
+        keep_frames_target = window_size * npfb
+
+        # ip_size=2: each rank populates only one of the two caches. The other
+        # stays at seq_len=0. All of kept_total / shift / csf must be computed
+        # from the populated cache to keep ranks in sync.
+        sample = None
+        for candidate in (self.kv_cache1, self.kv_cache_neg):
+            if candidate is not None and len(candidate) > 0 and candidate[0].shape[2] > 0:
+                sample = candidate[0]
+                break
+        if sample is None:
+            return
+
+        frames_in_cache = sample.shape[2] // frame_seqlen
+        kept_total = min(keep_frames_target, frames_in_cache)
+        # Sink can't exceed what we have; leaves kept_recent for the sliding tail.
+        sink_size = max(0, min(sink_size, kept_total))
+        kept_recent = kept_total - sink_size
+
+        if kept_total == 0:
+            return
+
+        # Cache frames are at positions [0 .. frames_in_cache - 1] (in steady
+        # state, guaranteed by previous slides keeping positions monotonic).
+        # The recent block we keep sits at old positions [frames_in_cache -
+        # kept_recent .. frames_in_cache - 1]; we want it at [sink_size ..
+        # sink_size + kept_recent - 1]. Shift = (old_start - new_start).
+        shift = frames_in_cache - kept_recent - sink_size
+
+        if shift == 0 or kept_recent == 0:
+            # Nothing to re-rope. Just update csf so next prefill lands past
+            # the kept block.
+            self.current_start_frame = kept_total + npfb
+            if self.ip_rank == 0:
+                seqlen = self.kv_cache1[0].shape[2] if self.kv_cache1 and self.kv_cache1[0].shape[2] > 0 else (
+                    self.kv_cache_neg[0].shape[2] if self.kv_cache_neg else 0)
+                print(f"[KV slide] no-shift: sink={sink_size}, recent={kept_recent}, "
+                      f"seq_len={seqlen}, csf={self.current_start_frame}")
+            return
+
+        # Re-rope correction for the recent block (sink stays untouched).
+        base_model = getattr(self.model, 'base_model', self.model)
+        base_model = getattr(base_model, 'model', base_model)
+        freqs0 = base_model.freqs[0]
+        if freqs0.device != sample.device:
+            freqs0 = freqs0.to(sample.device)
+            base_model.freqs[0] = freqs0
+        correction = freqs0[shift].conj()  # complex, [d0_complex]
+        d0_complex = correction.shape[0]
+
+        skip_math = os.environ.get("SKIP_REROPE_MATH", "0") == "1"
+
+        sink_len = sink_size * frame_seqlen
+        recent_len = kept_recent * frame_seqlen
+
+        for cache_list in [self.kv_cache1, self.kv_cache_neg]:
+            if cache_list is None:
+                continue
+            for i in range(len(cache_list)):
+                cache = cache_list[i]  # [2, B, seq_len, heads, head_dim]
+                if cache.shape[2] == 0:
+                    continue
+                # Defensive: cache shape must be large enough to hold sink + recent.
+                if cache.shape[2] < sink_len + recent_len:
+                    continue
+
+                sink_cache = cache[:, :, :sink_len, :, :]            # untouched
+                recent_cache = cache[:, :, -recent_len:, :, :]       # to be re-roped
+
+                if skip_math:
+                    cache_list[i] = torch.cat([sink_cache, recent_cache], dim=2).contiguous()
+                    continue
+
+                k = recent_cache[0]
+                v = recent_cache[1]
+                k_dtype = k.dtype
+
+                k_fp = k.to(torch.float64).reshape(*k.shape[:-1], -1, 2)
+                k_complex = torch.view_as_complex(k_fp)
+
+                k_frame = k_complex[..., :d0_complex] * correction
+                k_hw = k_complex[..., d0_complex:]
+                k_complex_new = torch.cat([k_frame, k_hw], dim=-1).contiguous()
+                k_new = torch.view_as_real(k_complex_new).flatten(-2).to(k_dtype)
+
+                recent_new = torch.stack([k_new, v.contiguous()], dim=0)
+                cache_list[i] = torch.cat([sink_cache, recent_new], dim=2).contiguous()
+
+        self.current_start_frame = kept_total + npfb
+
+        if self.ip_rank == 0:
+            seqlen = self.kv_cache1[0].shape[2] if self.kv_cache1 and self.kv_cache1[0].shape[2] > 0 else (
+                self.kv_cache_neg[0].shape[2] if self.kv_cache_neg else 0)
+            print(f"[KV slide+rerope+sink] shift={shift}, sink={sink_size}, recent={kept_recent}, "
+                  f"seq_len={seqlen}, csf={self.current_start_frame}")
+
     def sample_time(self, batch_size, device, dtype):
         sample = self.beta_dist.sample([batch_size]).to(device, dtype=dtype)
         return (self.config.noise_s - sample) / self.config.noise_s
@@ -546,7 +737,12 @@ class WANPolicyHead(ActionHead):
     def encode_image(self, image, num_frames, height, width):
         with torch.amp.autocast(dtype=torch.bfloat16, device_type=torch.device(self._device).type):
             batch_size = image.shape[0]
+            torch.cuda.synchronize()
+            import time as _time
+            _t0 = _time.perf_counter()
             clip_context = self.image_encoder.encode_image(image)
+            torch.cuda.synchronize()
+            _t1 = _time.perf_counter()
             msk = torch.ones(batch_size, num_frames, height//8, width//8, device=self._device)
             msk[:, 1:] = 0
             msk = torch.concat([torch.repeat_interleave(msk[:, 0:1], repeats=4, dim=1), msk[:, 1:]], dim=1)
@@ -556,8 +752,12 @@ class WANPolicyHead(ActionHead):
             image_input = image.transpose(1, 2)
             image_zeros = torch.zeros(batch_size, 3, num_frames-1, height, width, dtype=torch.bfloat16, device=self._device)
             self._ensure_vae_on_device(image_input)
+            _t2 = _time.perf_counter()
             with torch.no_grad():
                 y = self.vae.encode(torch.concat([image_input, image_zeros], dim=2))
+            torch.cuda.synchronize()
+            _t3 = _time.perf_counter()
+            print(f"[encode_image] CLIP: {_t1-_t0:.3f}s, _ensure_vae+prep: {_t2-_t1:.3f}s, VAE encode({batch_size},{3},{num_frames},{height},{width}): {_t3-_t2:.3f}s, total: {_t3-_t0:.3f}s")
             new_image = y[:, :, 0:1]
             # y shape is B * 16 * (1+(T-1)/4) * h/8 * w/8
             y = torch.concat([msk, y], dim=1)
@@ -826,6 +1026,8 @@ class WANPolicyHead(ActionHead):
             kv_cache = kv_caches[index]
             crossattn_cache = crossattn_caches[index]
             if not kv_cache_metadata["update_kv_cache"] and self.trt_engine is not None:
+                # TRT engine expects kv_cache as a single stacked tensor [num_layers, 2, B, kv_len, heads, dim]
+                kv_cache_packed = torch.stack(kv_cache, dim=0) if isinstance(kv_cache, list) else kv_cache
                 obs_noise_pred, action_noise_pred = self.trt_engine(
                     noisy_input,
                     timestep,
@@ -835,7 +1037,7 @@ class WANPolicyHead(ActionHead):
                     context=prompt_emb,
                     y=y,
                     clip_feature=clip_feature,
-                    kv_cache=kv_cache,
+                    kv_cache=kv_cache_packed,
                 )
             else:
                 obs_noise_pred, action_noise_pred, updated_kv_caches = self.model(
@@ -896,6 +1098,43 @@ class WANPolicyHead(ActionHead):
         assert all(isinstance(pred, tuple) for pred in output_predictions)
         return cast(list[tuple[torch.Tensor, torch.Tensor]], output_predictions)
     
+    def _build_dit_step_mask(self, num_steps: int) -> list[bool]:
+        """Build a step mask that distributes num_dit_steps compute steps across num_steps.
+
+        Strategy: always compute first 2 and last 1 steps (boundaries matter most),
+        then distribute remaining compute steps evenly through the middle.
+        """
+        n_dit = self.num_dit_steps
+        if n_dit <= 0 or n_dit >= num_steps:
+            return [True] * num_steps
+
+        mask = [False] * num_steps
+        # Always compute first 2 steps (need history for extrapolation)
+        mask[0] = True
+        if num_steps > 1:
+            mask[1] = True
+        # Always compute last step
+        mask[num_steps - 1] = True
+
+        anchors = min(3, n_dit)  # how many boundary steps we've used
+        remaining = n_dit - anchors
+        if remaining > 0:
+            # Distribute remaining steps evenly in the middle region [2, num_steps-2]
+            middle_start = 2
+            middle_end = num_steps - 2  # inclusive
+            middle_len = middle_end - middle_start + 1
+            if middle_len > 0 and remaining > 0:
+                # Evenly space remaining steps
+                for i in range(remaining):
+                    idx = middle_start + int((i + 0.5) * middle_len / remaining)
+                    idx = min(idx, middle_end)
+                    mask[idx] = True
+
+        if self.ip_rank == 0:
+            compute_indices = [i for i, v in enumerate(mask) if v]
+            print(f"DiT cache: {sum(mask)}/{num_steps} steps computed, indices={compute_indices}")
+        return mask
+
     def should_run_model(self, index, current_timestep, prev_predictions):
 
         if not self.dynamic_cache_schedule:
@@ -909,7 +1148,7 @@ class WANPolicyHead(ActionHead):
             self.skip_countdown -= 1
             return False
         elif self.skip_countdown == 1:
-            self.skip_countdown = 0 
+            self.skip_countdown = 0
             return True
 
         v_last = prev_predictions[-1][1].flatten(1).float()
@@ -965,6 +1204,14 @@ class WANPolicyHead(ActionHead):
         state_features = state_features.to(dtype=torch.bfloat16)
         videos = videos.to(dtype=torch.bfloat16)
 
+        # Use the original trigger (csf >= local_attn_size) for both modes.
+        # Sliding preemptively (every chunk) yields more rerope roundtrips
+        # through bf16 cache, and the accumulated quantization seems to
+        # degrade video prediction. With the original threshold, slide fires
+        # roughly every other chunk — half the rerope count.
+        use_kvpress = os.environ.get("USE_KVPRESS", "0") == "1"
+        slide_threshold = self.model.local_attn_size
+
         if self.language is None:
             print("language is None, reset current_start_frame to 0")
             self.language = data["text"]
@@ -973,12 +1220,25 @@ class WANPolicyHead(ActionHead):
             print("language changed, reset current_start_frame to 0")
             self.current_start_frame = 0
             self.language = data["text"]
-        elif videos.shape[2] == 1:
-            print("videos.shape[2] == 1, reset current_start_frame to 0")
+        elif videos.shape[2] == 1 and not use_kvpress:
+            # Clean baseline semantics: every single-frame sync inference is
+            # independent — reset cache every chunk. Only applies when kvpress
+            # is off; with kvpress we want cache to carry across chunks for
+            # sliding + rerope.
             self.current_start_frame = 0
-        elif self.current_start_frame >= self.model.local_attn_size:
-            print("current_start_frame >= local_attn_size, reset current_start_frame to 0")
-            self.current_start_frame = 0
+        elif self.current_start_frame >= slide_threshold:
+            if use_kvpress:
+                # Sliding window with RoPE-shift re-encoding on kept K.
+                window_size = int(os.environ.get("KV_WINDOW_SIZE", "4"))
+                self._slide_kv_window(window_size=window_size)
+                # Mark that we need to refresh CLIP/ys features from current obs
+                # (KV cache is kept, but visual conditioning must be updated)
+                self._need_reencode = True
+            else:
+                print("current_start_frame >= local_attn_size, reset current_start_frame to 0")
+                self.current_start_frame = 0
+        # Note: removed "videos.shape[2] == 1 → reset" logic.
+        # Single-frame input should decode into existing KV cache, not reset it.
 
         if self.ip_rank == 0:
             print("videos shape", videos.shape, self.num_frames)
@@ -1003,7 +1263,23 @@ class WANPolicyHead(ActionHead):
             clip_feas, ys, image = self.encode_image(image, self.num_frames, height, width)
             self.clip_feas = clip_feas.to(dtype=image.dtype)
             self.ys = ys.to(dtype=image.dtype)
-        
+            # At csf=0 reset, if latent_video is provided (async mode), use its first
+            # frame as the initial KV entry instead of the real observation's VAE output.
+            # clip_feas and ys still come from the real observation (needed for cross-attn).
+            if latent_video is not None:
+                image = latent_video[:, :, :1]
+                if self.ip_rank == 0:
+                    print(f"[csf=0] Using latent_video first frame as initial image, shape={image.shape}")
+        elif getattr(self, '_need_reencode', False):
+            # After KV sliding window: refresh CLIP features and ys from current observation
+            # but DON'T reinit KV cache or process initial frame
+            clip_feas, ys, _ = self.encode_image(image, self.num_frames, height, width)
+            self.clip_feas = clip_feas.to(dtype=image.dtype)
+            self.ys = ys.to(dtype=image.dtype)
+            self._need_reencode = False
+            if self.ip_rank == 0:
+                print(f"[KV slide] Re-encoded CLIP/ys from current observation")
+
         assert self.clip_feas is not None and self.ys is not None, "clip_feas and ys must be set"
 
         end_image_encoder_event.record()
@@ -1015,18 +1291,17 @@ class WANPolicyHead(ActionHead):
             if self.ip_rank == 0:
                 print("image shape@@", image.shape)
         elif self.current_start_frame != 0:
-            # this is for real world execution
-            if (videos.shape[2] - 1) // 4 == self.num_frame_per_block:
-                print("no further action")
-            elif videos.shape[2] // 4 != self.num_frame_per_block:
-                # Repeating videos along dim 2.
-                repeat_factor = self.num_frame_per_block // (videos.shape[2] // 4)
-                videos = torch.repeat_interleave(videos, repeat_factor, dim=2)
-            
-                first_frame = videos[:, :, 0:1]  # Extract first frame
-                videos = torch.cat([first_frame, videos], dim=2)
-            else: 
-                first_frame = videos[:, :, 0:1]  # Extract first frame
+            # Decode mode: append new observation to existing KV cache.
+            # Model needs (num_frame_per_block * 4 + 1) raw frames for VAE encoding.
+            target_raw_frames = self.num_frame_per_block * 4 + 1  # e.g. 9
+            num_input_frames = videos.shape[2]
+            if (num_input_frames - 1) // 4 == self.num_frame_per_block:
+                pass  # Already correct number of frames
+            elif num_input_frames < target_raw_frames:
+                # Repeat single/few frames to fill the required count
+                videos = videos[:, :, -1:].repeat(1, 1, target_raw_frames, 1, 1)
+            else:
+                first_frame = videos[:, :, 0:1]
                 videos = torch.cat([first_frame, videos], dim=2)
            
             image = self.vae.encode(
@@ -1158,10 +1433,14 @@ class WANPolicyHead(ActionHead):
 
         start_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in sample_scheduler.timesteps]
         end_diffusion_events = [torch.cuda.Event(enable_timing=True) for _ in sample_scheduler.timesteps]
-        prev_predictions = [] 
+        prev_predictions = []
         self.skip_countdown = 0
         dit_compute_steps = 0
+        # Build dit_step_mask dynamically based on actual num_inference_steps
+        self.dit_step_mask = self._build_dit_step_mask(len(sample_scheduler.timesteps))
+        _loop_wall_times = []
         for index, current_timestep in enumerate(sample_scheduler.timesteps):
+            _loop_step_start = time.perf_counter()
             start_diffusion_events[index].record()
 
             # Get timesteps from respective schedulers
@@ -1211,13 +1490,22 @@ class WANPolicyHead(ActionHead):
 
                 flow_pred = flow_pred_uncond + self.cfg_scale * (flow_pred_cond - flow_pred_uncond)
                 prev_predictions.append((current_timestep, flow_pred, flow_pred_cond_action))
-                max_cache_size = 2
+                max_cache_size = 3
                 if len(prev_predictions) > max_cache_size:
                     prev_predictions.pop(0)
 
             else:
                 assert len(prev_predictions) > 0, "prev_predictions must be set when skipping"
-                _, flow_pred, flow_pred_cond_action = prev_predictions[-1]
+                if self.cache_extrapolate and len(prev_predictions) >= 2:
+                    # Linear extrapolation using two most recent computed velocities
+                    t2, f2, f2_action = prev_predictions[-2]
+                    t1, f1, f1_action = prev_predictions[-1]
+                    flow_pred = self.cache_predict_order1(current_timestep, t1, f1, t2, f2)
+                    flow_pred_cond_action = self.cache_predict_order1(
+                        current_timestep, t1, f1_action, t2, f2_action)
+                else:
+                    # Fallback: simple reuse of last prediction
+                    _, flow_pred, flow_pred_cond_action = prev_predictions[-1]
 
             end_diffusion_events[index].record()
 
@@ -1238,13 +1526,38 @@ class WANPolicyHead(ActionHead):
                 step_index=index,
                 return_dict=False,
             )[0]
+            torch.cuda.synchronize()
+            _loop_wall_times.append(time.perf_counter() - _loop_step_start)
+
+        if self.ip_rank == 0:
+            for i, wt in enumerate(_loop_wall_times):
+                print(f"  [diffusion_loop] step {i}: {wt:.3f}s (wall)")
 
         latents = noisy_input
         latents_action = noisy_input_action
         output = latents
 
         if self.current_start_frame == 1:
+            # Baseline path: prepend the init VAE-encoded observation so the
+            # VAE decoder has a warm causal feat_cache when decoding pred_0.
             output = torch.cat([image, output], dim=1)
+        elif use_kvpress:
+            # In kvpress sliding mode, we skip the csf==1 branch on all chunks
+            # except the very first, so pred_0 ends up at VAE decode position 0
+            # with empty feat_cache — producing cold-start artifacts (color
+            # shift / blur). Prepend a real-observation latent (same mechanism
+            # baseline uses at csf==1) so decoder sees warm context. Prefer
+            # the re-encoded ys latent (matches encode_image's new_image) and
+            # fall back to the current-obs VAE encoding.
+            warmup_latent = None
+            ys = getattr(self, "ys", None)
+            if ys is not None and ys.shape[2] >= 1 and ys.shape[1] >= 20:
+                # ys is [B, 4+16, T_lat, h/8, w/8]; VAE portion is channels 4:
+                warmup_latent = ys[:, 4:, 0:1, :, :].transpose(1, 2).to(dtype=output.dtype)
+            elif image is not None and image.shape[1] >= 1:
+                warmup_latent = image[:, -1:, ...].to(dtype=output.dtype)
+            if warmup_latent is not None:
+                output = torch.cat([warmup_latent, output], dim=1)
         self.current_start_frame += self.num_frame_per_block
 
         # Do torch.cuda.synchronize() to ensure all operations are completed before timing.
@@ -1295,31 +1608,23 @@ class WANPolicyHead(ActionHead):
         LOAD_TRT_ENGINE = os.getenv("LOAD_TRT_ENGINE", None)
 
         # Torch compile the modules.
+        # NOTE: _forward_blocks compilation is deferred to parallelize() so that
+        # tensor parallelism sharding (all_reduce ops, reshaped weights) is in
+        # place before the graph is captured.  Other modules (text_encoder,
+        # image_encoder, vae) are unaffected by TP and can be compiled here.
         if not ENABLE_TENSORRT:
-            print("Torch compiling the Wan, TextEncoder, ImageEncoder, and VAE modules.")
+            print("Torch compiling the TextEncoder, ImageEncoder, and VAE modules.")
 
-            self.model._forward_blocks = torch.compile(
-                mode="reduce-overhead", fullgraph=True, dynamic=False,
-            )(self.model._forward_blocks)
-
-            self.text_encoder.forward = torch.compile(
-                mode="reduce-overhead", fullgraph=True, dynamic=False,
-            )(self.text_encoder.forward)
-
-            self.image_encoder.model.visual.forward = torch.compile(
-                mode="reduce-overhead", fullgraph=True, dynamic=False,
-            )(self.image_encoder.model.visual.forward)
-
-            self.vae.model.encode = torch.compile(
-                mode="reduce-overhead", fullgraph=True, dynamic=False,
-            )(self.vae.model.encode)
+            # Skip torch.compile for TextEncoder, CLIP, and VAE to avoid
+            # slow first-call CUDA graph capture and recompilation on shape
+            # changes. These are lightweight relative to the DiT backbone.
         
         self.trt_engine = None
         if LOAD_TRT_ENGINE is not None:
-            print(f"Loading TRT engine from {LOAD_TRT_ENGINE}")
-            import groot.control.main.vla.tensorrt_utils as trt_utils
+            print(f"Loading TRT engine from {LOAD_TRT_ENGINE} on device {self._device}")
+            import groot.vla.model.dreamzero.tensorrt_utils as trt_utils
             model_path = LOAD_TRT_ENGINE
-            self.trt_engine = trt_utils.load_tensorrt_engine(model_path, model_type="ar_14B")
+            self.trt_engine = trt_utils.load_tensorrt_engine(model_path, model_type="ar_14B", device=self._device)
 
     def parallelize(self, device_mesh: DeviceMesh) -> None:
         ip_mesh = device_mesh["ip"]
@@ -1329,6 +1634,71 @@ class WANPolicyHead(ActionHead):
 
         assert self.ip_size == 1 or self.ip_size == 2, "ip_size must be 1 or 2"
         assert self.ip_rank >= 0 and self.ip_rank < self.ip_size, "ip_rank must be in [0, ip_size)"
+
+        # Tensor parallelism across the "tp" dimension (if present)
+        if "tp" in device_mesh.mesh_dim_names:
+            tp_mesh = device_mesh["tp"]
+            if tp_mesh.size() > 1:
+                self.model.parallelize_tp(tp_mesh)
+
+        # Convert DiT Linear layers to FP8 (after TP sharding so weight shapes are final)
+        import os
+        ENABLE_FP8 = os.getenv("ENABLE_FP8", "False").lower() == "true"
+        if ENABLE_FP8:
+            # Skip norm layers and small embeddings — only convert the heavy matmuls
+            n = convert_model_to_fp8(self.model, skip_names=("norm", "embedding", "head.head"))
+            print(f"Converted {n} Linear layers to FP8 in DiT model")
+
+        # Apply Token Merging if requested via env var (must be before compile).
+        tome_ratio = float(os.getenv("TOME_RATIO", "0"))
+        if tome_ratio > 0:
+            self.model.set_tome(ratio=tome_ratio)
+            print(f"ToMe enabled: ratio={tome_ratio}, "
+                  f"tome_r={self.model.blocks[0].tome_r} tokens/frame")
+
+        # Now that TP sharding is applied (weights reshaped, all_reduce ops in
+        # place), it is safe to torch.compile _forward_blocks.
+        ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
+        ENABLE_PCG = os.getenv("ENABLE_PCG", "False").lower() == "true"
+        DISABLE_COMPILE = os.getenv("DISABLE_COMPILE", "False").lower() == "true"
+        tp_active = ("tp" in device_mesh.mesh_dim_names
+                     and device_mesh["tp"].size() > 1)
+        if ENABLE_PCG and tp_active:
+            # Piecewise CUDA Graph: captures _forward_blocks as graph segments
+            # separated by eager all_reduce calls. Replaces torch.compile.
+            from groot.vla.model.dreamzero.modules.pcg_runner import PCGRunner
+            tp_group = device_mesh["tp"].get_group()
+            original_forward = self.model._forward_blocks
+            self._pcg_runner = PCGRunner(self.model, tp_group, original_forward)
+            self.model._forward_blocks = self._pcg_runner
+            print("PCG enabled: will capture piecewise CUDA graphs on first inference")
+        elif not ENABLE_TENSORRT and not DISABLE_COMPILE:
+            tome_active = getattr(self.model, 'tome_ratio', 0.0) > 0
+            if tome_active:
+                # ToMe merge indices are computed eagerly outside _forward_blocks
+                # and passed as parameters. The MergeInfo tensors change values each
+                # call, triggering guard failures with fullgraph=True.
+                # Use fullgraph=False to avoid recompilation.
+                print("Torch compiling _forward_blocks with fullgraph=False (ToMe active).")
+                self.model._forward_blocks = torch.compile(
+                    mode="default", fullgraph=False, dynamic=False,
+                )(self.model._forward_blocks)
+            elif tp_active:
+                # Try reduce-overhead (CUDA graphs) for maximum performance.
+                # Previously deadlocked with NCCL, but we now pre-warm all
+                # communicators (eager + funcol) before model loading.
+                compile_mode = os.getenv("COMPILE_MODE", "default")
+                print(f"Torch compiling _forward_blocks with mode={compile_mode} (TP active).")
+                use_dynamic = os.getenv("COMPILE_DYNAMIC", "false").lower() == "true"
+                print(f"  dynamic={use_dynamic}")
+                self.model._forward_blocks = torch.compile(
+                    mode=compile_mode, fullgraph=not ENABLE_FP8, dynamic=use_dynamic,
+                )(self.model._forward_blocks)
+            else:
+                print("Torch compiling _forward_blocks (after TP sharding).")
+                self.model._forward_blocks = torch.compile(
+                    mode="reduce-overhead", fullgraph=True, dynamic=False,
+                )(self.model._forward_blocks)
 
     @property
     def device(self):

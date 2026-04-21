@@ -78,6 +78,8 @@ class WebsocketPolicyServer:
             self._port,
             compression=None,
             max_size=None,
+            ping_interval=None,   # disable keepalive pings — inference can take >20s
+            ping_timeout=None,
         ) as server:
             await server.serve_forever()
 
@@ -91,9 +93,10 @@ class WebsocketPolicyServer:
         while True:
             try:
                 obs = msgpack_numpy.unpackb(await websocket.recv())
-                
-                endpoint = obs["endpoint"]
-                del obs["endpoint"]
+
+                # "endpoint" key is optional: openpi_client doesn't send it,
+                # so default to "infer" when absent.
+                endpoint = obs.pop("endpoint", "infer")
                 if endpoint == "reset":
                     self._policy.reset(obs)
                     to_return = "reset successful"

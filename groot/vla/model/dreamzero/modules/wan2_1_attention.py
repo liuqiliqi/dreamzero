@@ -7,6 +7,12 @@ import time
 from typing import Optional
 import os
 
+# Cache for static integer tensors used in flash_attention.
+# torch.tensor(values, device='cuda') performs a host-to-device copy which
+# is forbidden inside CUDA graph capture.  We create these tensors once
+# (during warmup) and reuse them in every subsequent call.
+_FLASH_ATTN_LENS_CACHE: dict = {}
+
 try:
     import flash_attn_interface
 
@@ -29,7 +35,7 @@ try:
     import transformer_engine
     from groot.vla.model.dreamzero.modules.cudnn_attention import DotProductAttention
     TRANSFORMER_ENGINE_AVAILABLE = True
-except ModuleNotFoundError:
+except (ModuleNotFoundError, ImportError):
     TRANSFORMER_ENGINE_AVAILABLE = False
 
 import warnings
@@ -85,7 +91,11 @@ def flash_attention(
     # preprocess query
     if q_lens is None:
         q = half(q.flatten(0, 1))
-        q_lens = torch.tensor([lq] * b, dtype=torch.int32, device=q.device)
+        _key_q = (b, lq, q.device.type, q.device.index)
+        if _key_q not in _FLASH_ATTN_LENS_CACHE:
+            _FLASH_ATTN_LENS_CACHE[_key_q] = torch.tensor(
+                [lq] * b, dtype=torch.int32, device=q.device)
+        q_lens = _FLASH_ATTN_LENS_CACHE[_key_q]
     else:
         q = half(torch.cat([u[:v] for u, v in zip(q, q_lens)]))
 
@@ -93,7 +103,11 @@ def flash_attention(
     if k_lens is None:
         k = half(k.flatten(0, 1))
         v = half(v.flatten(0, 1))
-        k_lens = torch.tensor([lk] * b, dtype=torch.int32, device=k.device)
+        _key_k = (b, lk, k.device.type, k.device.index)
+        if _key_k not in _FLASH_ATTN_LENS_CACHE:
+            _FLASH_ATTN_LENS_CACHE[_key_k] = torch.tensor(
+                [lk] * b, dtype=torch.int32, device=k.device)
+        k_lens = _FLASH_ATTN_LENS_CACHE[_key_k]
     else:
         k = half(torch.cat([u[:v] for u, v in zip(k, k_lens)]))
         v = half(torch.cat([u[:v] for u, v in zip(v, k_lens)]))
