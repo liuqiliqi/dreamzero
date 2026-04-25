@@ -19,8 +19,8 @@ from openpi_client import msgpack_numpy
 # send a pong response immediately if it is busy processing a request.
 # Increase the ping interval and timeout so that the client can wait
 # for a longer time before closing the connection.
-PING_INTERVAL_SECS = 120
-PING_TIMEOUT_SECS = 3600
+PING_INTERVAL_SECS = 60
+PING_TIMEOUT_SECS = 600
 
 class WebsocketClientPolicy(BasePolicy):
     """Implements the Policy interface by communicating with a server over websocket.

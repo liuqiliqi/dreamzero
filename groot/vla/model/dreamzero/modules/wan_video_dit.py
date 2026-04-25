@@ -25,6 +25,20 @@ try:
 except ModuleNotFoundError:
     SAGE_ATTN_AVAILABLE = False
 
+
+def _gpu_supports_flash_attention():
+    """FlashAttention requires Ampere (compute capability 8.0) or newer."""
+    if not (FLASH_ATTN_2_AVAILABLE or FLASH_ATTN_3_AVAILABLE):
+        return False
+    try:
+        if not torch.cuda.is_available():
+            return False
+        cap = torch.cuda.get_device_capability()
+        return cap[0] >= 8
+    except Exception:
+        return False
+
+
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.models.modeling_utils import ModelMixin
     
@@ -37,7 +51,8 @@ else:
     DISABLE_TORCH_COMPILE = False
     FLASH_ATTN_COMPATIBILITY_MODE = False
 def flash_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, num_heads: int, compatibility_mode=False):
-    if compatibility_mode:
+    # Use PyTorch SDPA on pre-Ampere GPUs or when compatibility_mode (FlashAttention requires Ampere or newer)
+    if compatibility_mode or not _gpu_supports_flash_attention():
         q = rearrange(q, "b s (n d) -> b n s d", n=num_heads)
         k = rearrange(k, "b s (n d) -> b n s d", n=num_heads)
         v = rearrange(v, "b s (n d) -> b n s d", n=num_heads)

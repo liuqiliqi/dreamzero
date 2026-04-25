@@ -452,7 +452,7 @@ def main():
     parser.add_argument(
         "--pred-video-dir",
         type=str,
-        default="/fact_home/qiliu/worldmodel/sim-evals/runs/pred_videos",
+        default="/fact_data/qiliu/worldmodel_data/sim-evals/runs/pred_videos",
         help="Directory to save AI prediction videos (decoded from VAE latents)",
     )
     args = parser.parse_args()

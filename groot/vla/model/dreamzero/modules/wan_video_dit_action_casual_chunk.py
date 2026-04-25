@@ -25,35 +25,7 @@ import math
 import torch.distributed as dist
 import os
 
-from groot.vla.model.dreamzero.modules.tome_utils import (
-    compute_merge_indices_deterministic,
-    merge_kv,
-)
-
 ENABLE_TENSORRT = os.getenv("ENABLE_TENSORRT", "False").lower() == "true"
-
-
-def _shard_linear_column(linear: nn.Linear, tp_rank: int, tp_size: int) -> None:
-    """Shard a Linear layer column-wise (split output dim)."""
-    out_features = linear.out_features // tp_size
-    start = tp_rank * out_features
-    end = start + out_features
-    linear.weight = nn.Parameter(linear.weight[start:end].contiguous())
-    if linear.bias is not None:
-        linear.bias = nn.Parameter(linear.bias[start:end].contiguous())
-    linear.out_features = out_features
-
-
-def _shard_linear_row(linear: nn.Linear, tp_rank: int, tp_size: int) -> None:
-    """Shard a Linear layer row-wise (split input dim)."""
-    in_features = linear.in_features // tp_size
-    start = tp_rank * in_features
-    end = start + in_features
-    linear.weight = nn.Parameter(linear.weight[:, start:end].contiguous())
-    # Only rank 0 keeps bias; others zero it to avoid double-counting after all-reduce
-    if linear.bias is not None and tp_rank != 0:
-        linear.bias = nn.Parameter(torch.zeros_like(linear.bias))
-    linear.in_features = in_features
 
 
 class CategorySpecificLinear(nn.Module):
@@ -240,11 +212,6 @@ class CausalWanSelfAttention(nn.Module):
         self.frame_seqlen = frame_seqlen
         self.num_action_per_block = num_action_per_block
         self.num_state_per_block = num_state_per_block
-        # tensor parallelism (defaults for no TP)
-        self.tp_size = 1
-        self.tp_rank = 0
-        self.tp_group = None
-        self._full_num_heads = num_heads
         # layers
         self.q = nn.Linear(dim, dim)
         self.k = nn.Linear(dim, dim)
@@ -254,10 +221,6 @@ class CausalWanSelfAttention(nn.Module):
         self.norm_k = WanRMSNorm(dim, eps=eps) if qk_norm else nn.Identity()
         self.attn = AttentionModule(num_heads=self.num_heads, head_dim=self.head_dim)
         self.causal_attn = AttentionModule(num_heads=self.num_heads, head_dim=self.head_dim, causal=True)
-
-    def _all_reduce(self, tensor, group=None):
-        """All-reduce hook point for PCG. Can be replaced at instance level."""
-        dist.all_reduce(tensor, group=group)
 
     def _visualize_attention_mask(self, total_len, first_image_len, image_blocks_len, 
                                    action_len, state_len, num_image_blocks, 
@@ -830,7 +793,6 @@ class CausalWanSelfAttention(nn.Module):
         kv_cache: torch.Tensor | None = None,
         current_start_frame: int = 0,
         is_tf: bool = True,
-        tome_info=None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         r"""
         Args:
@@ -841,21 +803,11 @@ class CausalWanSelfAttention(nn.Module):
         b, s, n, d = *x.shape[:2], self.num_heads, self.head_dim
 
         # query, key, value function
-        if self.tp_size > 1:
-            full_n = self._full_num_heads
-            head_start = self.tp_rank * n
-            head_end = head_start + n
-            def qkv_fn(x):
-                q = self.norm_q(self.q(x)).view(b, s, full_n, d)[:, :, head_start:head_end, :].contiguous()
-                k = self.norm_k(self.k(x)).view(b, s, full_n, d)[:, :, head_start:head_end, :].contiguous()
-                v = self.v(x).view(b, s, full_n, d)[:, :, head_start:head_end, :].contiguous()
-                return q, k, v
-        else:
-            def qkv_fn(x):
-                q = self.norm_q(self.q(x)).view(b, s, n, d)
-                k = self.norm_k(self.k(x)).view(b, s, n, d)
-                v = self.v(x).view(b, s, n, d)
-                return q, k, v
+        def qkv_fn(x):
+            q = self.norm_q(self.q(x)).view(b, s, n, d)
+            k = self.norm_k(self.k(x)).view(b, s, n, d)
+            v = self.v(x).view(b, s, n, d)
+            return q, k, v
 
         q, k, v = qkv_fn(x)
 
@@ -939,14 +891,23 @@ class CausalWanSelfAttention(nn.Module):
                     action_horizon = num_image_blocks * self.num_action_per_block
                     state_horizon = num_image_blocks * self.num_state_per_block
                     
+                    # Block layout must match actual register length. For 5B use 320x176 so latent frame_seqlen=55.
+                    if roped_query.shape[1] != half_seq_len + noisy_image_seq_len + action_horizon + state_horizon:
+                        raise ValueError(
+                            "Sequence length does not match block layout. "
+                            "For 5B use 320x176 (e.g. data=dreamzero/droid_relative_wan22 or image_resolution_width=320, image_resolution_height=176). "
+                            f"Got noisy_frames={noisy_frames}, num_image_blocks={num_image_blocks}, "
+                            f"action_register_length={action_register_length}. "
+                            "Ensure (noisy_frames - 1) // num_frame_per_block >= 1 and register length equals "
+                            "num_blocks * (num_action_per_block + num_state_per_block)."
+                        )
+                    
                     # Split clean and noisy parts
                     # Clean: [image tokens only]
                     clean_image_q = roped_query[:, :clean_image_seq_len]
                     clean_image_k = roped_key[:, :clean_image_seq_len]
                     clean_image_v = v[:, :clean_image_seq_len]
 
-                    assert roped_query.shape[1] == half_seq_len + noisy_image_seq_len + action_horizon + state_horizon
-                    
                     # Noisy: [image tokens][action tokens][state tokens]
                     noisy_image_q = roped_query[:, half_seq_len:half_seq_len + noisy_image_seq_len]
                     noisy_action_q = roped_query[:, half_seq_len + noisy_image_seq_len:half_seq_len + noisy_image_seq_len + action_horizon]
@@ -1093,13 +1054,9 @@ class CausalWanSelfAttention(nn.Module):
                 assert roped_action_key is not None
                 assert action_v is not None
 
-            # --- ToMe: merge K and V only (Q stays full resolution) ---
-            if tome_info is not None:
-                roped_key = merge_kv(roped_key, tome_info)
-                v = merge_kv(v, tome_info)
-
             num_new_tokens = roped_query.shape[1]
-            # K/V may be shorter than Q when ToMe is active — that's expected
+            assert roped_key.shape[1] == num_new_tokens
+            assert v.shape[1] == num_new_tokens
 
             # If we are using local attention and the current KV cache size is larger
             # than the local attention size, we need to truncate the KV cache
@@ -1133,44 +1090,7 @@ class CausalWanSelfAttention(nn.Module):
         # output
         x = x.flatten(2)
         x = self.o(x)
-        if self.tp_size > 1:
-            self._all_reduce(x, group=self.tp_group)
         return x, updated_kv_cache
-
-    def parallelize_tp(self, tp_mesh) -> None:
-        """Apply tensor parallelism: shard attention heads across TP ranks.
-
-        Q/K/V projections and RMSNorm stay replicated (norm needs full dim).
-        Heads are sliced after norm+reshape. O-proj is row-parallel + all-reduce.
-        """
-        self.tp_rank = tp_mesh.get_local_rank()
-        self.tp_size = tp_mesh.size()
-        self.tp_group = tp_mesh.get_group()
-
-        assert self.num_heads % self.tp_size == 0, \
-            f"num_heads={self.num_heads} must be divisible by tp_size={self.tp_size}"
-
-        local_num_heads = self.num_heads // self.tp_size
-
-        # Shard O-proj: row-parallel (input local_heads * head_dim, output dim)
-        head_start = self.tp_rank * local_num_heads
-        head_end = head_start + local_num_heads
-        w_o = self.o.weight.data  # (dim, dim)
-        w_o_heads = w_o.view(self.dim, self.num_heads, self.head_dim)
-        w_o_local = w_o_heads[:, head_start:head_end, :].reshape(self.dim, local_num_heads * self.head_dim).contiguous()
-        self.o.weight = nn.Parameter(w_o_local)
-        self.o.in_features = local_num_heads * self.head_dim
-        # Only rank 0 keeps O-proj bias to avoid double-counting after all-reduce
-        if self.o.bias is not None and self.tp_rank != 0:
-            self.o.bias = nn.Parameter(torch.zeros_like(self.o.bias))
-
-        # Store full num_heads for QKV reshape, update to local for attention
-        self._full_num_heads = self.num_heads
-        self.num_heads = local_num_heads
-
-        # Update AttentionModule instances for local head count
-        self.attn = AttentionModule(num_heads=self.num_heads, head_dim=self.head_dim)
-        self.causal_attn = AttentionModule(num_heads=self.num_heads, head_dim=self.head_dim, causal=True)
 
 
 class CausalWanAttentionBlock(nn.Module):
@@ -1228,35 +1148,6 @@ class CausalWanAttentionBlock(nn.Module):
         # modulation
         self.modulation = nn.Parameter(torch.randn(1, 6, dim) / dim**0.5)
 
-        # token merging (disabled by default)
-        self.tome_r = 0
-        self.frame_seqlen = frame_seqlen
-
-        # tensor parallelism (defaults for no TP)
-        self._tp_size = 1
-        self._tp_group = None
-
-    def _all_reduce(self, tensor, group=None):
-        """All-reduce hook point for PCG. Can be replaced at instance level."""
-        dist.all_reduce(tensor, group=group)
-
-    def parallelize_tp(self, tp_mesh) -> None:
-        """Apply tensor parallelism to self-attn, cross-attn, and FFN."""
-        tp_rank = tp_mesh.get_local_rank()
-        tp_size = tp_mesh.size()
-        self._tp_size = tp_size
-        self._tp_group = tp_mesh.get_group()
-
-        # Self-attention TP
-        self.self_attn.parallelize_tp(tp_mesh)
-
-        # Cross-attention TP
-        self.cross_attn.parallelize_tp(tp_mesh)
-
-        # FFN TP: column-parallel up-proj, row-parallel down-proj + all-reduce
-        _shard_linear_column(self.ffn[0], tp_rank, tp_size)  # Linear(dim, ffn_dim) -> split output
-        _shard_linear_row(self.ffn[2], tp_rank, tp_size)     # Linear(ffn_dim, dim) -> split input
-
     def forward(
         self,
         x: torch.Tensor,
@@ -1270,18 +1161,30 @@ class CausalWanAttentionBlock(nn.Module):
         crossattn_cache: torch.Tensor | None = None,
         current_start_frame: int = 0,
         is_tf: bool = True,
-        tome_info=None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         r"""
         Args:
             x(Tensor): Shape [B, L, C]
             e(Tensor): Shape [B, F, 6, C]
             freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
-            tome_info: Precomputed MergeInfo from _forward_blocks, or None.
         """
         e = (self.modulation.unsqueeze(1) + e).chunk(6, dim=2)
 
-        # self-attention (ToMe KV-only merge happens inside self_attn)
+        # Align modulation sequence length to x so mul/add broadcast (e.g. when F != L under compile)
+        L = x.shape[1]
+        aligned = []
+        for part in e:
+            L_e = part.shape[1]
+            if L_e == L:
+                aligned.append(part)
+            elif L_e >= L:
+                aligned.append(part[:, :L])
+            else:
+                repeat = (L + L_e - 1) // L_e
+                aligned.append(part.repeat_interleave(repeat, dim=1)[:, :L])
+        e = tuple(aligned)
+
+        # self-attention
         y, updated_kv_cache = self.self_attn(
             x=(self.norm1(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2)),
             freqs=freqs,
@@ -1291,9 +1194,7 @@ class CausalWanAttentionBlock(nn.Module):
             kv_cache=kv_cache,
             is_tf=is_tf,
             current_start_frame=current_start_frame,
-            tome_info=tome_info,
         )
-
         x = x + (y * e[2].squeeze(2))
 
         # cross-attention & ffn function
@@ -1302,13 +1203,10 @@ class CausalWanAttentionBlock(nn.Module):
             y = self.ffn(
                 (self.norm2(x) * (1 + e[4].squeeze(2)) + e[3].squeeze(2))
             )
-            if self._tp_size > 1:
-                self._all_reduce(y, group=self._tp_group)
             x = x + (y * e[5].squeeze(2))
             return x
 
         x = cross_attn_ffn(x, context, e)
-
         return x, updated_kv_cache
 
 
@@ -1336,6 +1234,19 @@ class CausalHead(nn.Module):
             e(Tensor): Shape [B, F, 1, C]
         """
         e = (self.modulation.unsqueeze(1) + e).chunk(2, dim=2)
+        # Align modulation sequence length to x (e.g. when F != L1 under compile)
+        L = x.shape[1]
+        aligned = []
+        for part in e:
+            L_e = part.shape[1]
+            if L_e == L:
+                aligned.append(part)
+            elif L_e >= L:
+                aligned.append(part[:, :L])
+            else:
+                repeat = (L + L_e - 1) // L_e
+                aligned.append(part.repeat_interleave(repeat, dim=1)[:, :L])
+        e = tuple(aligned)
         x = (self.head(self.norm(x) * (1 + e[1].squeeze(2)) + e[0].squeeze(2)))
         return x
 
@@ -1378,11 +1289,14 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                  hidden_size=1024,
                  diffusion_model_pretrained_path=None,
                  num_action_per_block=32,
-                 num_state_per_block=1):
+                 num_state_per_block=1,
+                 concat_first_frame_latent=True):
         r"""
         Initialize the diffusion model backbone.
 
         Args:
+            concat_first_frame_latent (`bool`, *optional*, defaults to True):
+                If True, concat [x; y] before patch_embedding (14B I2V style). If False, latent only (5B pretrained style; first-frame via CLIP).
             model_type (`str`, *optional*, defaults to 't2v'):
                 Model variant - 't2v' (text-to-video) or 'i2v' (image-to-video)
             patch_size (`tuple`, *optional*, defaults to (1, 2, 2)):
@@ -1446,6 +1360,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.hidden_size = hidden_size
         self.num_action_per_block = num_action_per_block
         self.num_state_per_block = num_state_per_block
+        self.concat_first_frame_latent = concat_first_frame_latent
 
         max_num_embodiments = 1
 
@@ -1502,7 +1417,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             rope_params(1024, 2 * (d // 6)),
             rope_params(1024, 2 * (d // 6)),
         ]
-        if model_type == 'i2v':
+        if model_type in ('i2v', 'ti2v'):
             self.img_emb = MLPProj(1280, dim)
 
         # initialize weights
@@ -1511,39 +1426,9 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         self.gradient_checkpointing = True
         self.independent_first_frame = False if self.num_frame_per_block == 1 else True
 
-        # ToMe defaults (disabled)
-        self.tome_ratio = 0.0
-
-    def set_tome(
-        self,
-        ratio: float = 0.5,
-        start_layer: int = 0,
-        end_layer: int = -1,
-    ) -> None:
-        """Enable Token Merging for inference acceleration.
-
-        Args:
-            ratio: Fraction of image tokens to merge per frame (0.0-1.0).
-            start_layer: First block index to apply ToMe.
-            end_layer: Last block index (-1 = last block).
-        """
-        self.tome_ratio = ratio
-        tome_r = int(self.frame_seqlen * ratio)
-        end = end_layer if end_layer >= 0 else len(self.blocks) - 1
-        for i, block in enumerate(self.blocks):
-            if start_layer <= i <= end and tome_r > 0:
-                block.tome_r = tome_r
-            else:
-                block.tome_r = 0
-
 
     def _set_gradient_checkpointing(self, module, value=False):
         self.gradient_checkpointing = value
-
-    def parallelize_tp(self, tp_mesh) -> None:
-        """Apply tensor parallelism to all transformer blocks."""
-        for block in self.blocks:
-            block.parallelize_tp(tp_mesh)
 
     @staticmethod
     def _prepare_blockwise_causal_attn_mask(
@@ -1867,16 +1752,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         F = timestep.shape[1]
 
         if action is not None:
-            # Cache the embodiment_id tensor to avoid host-to-device copy during
-            # CUDA graph capture (torch.tensor with device='cuda' is forbidden).
-            _emb_key = (x.shape[0], x.device.type, x.device.index)
-            if not hasattr(self, '_embodiment_id_cache'):
-                self._embodiment_id_cache = {}
-            if _emb_key not in self._embodiment_id_cache:
-                self._embodiment_id_cache[_emb_key] = (
-                    torch.tensor([0], device=x.device).repeat(x.shape[0])
-                )
-            embodiment_id = self._embodiment_id_cache[_emb_key]
+            embodiment_id = torch.tensor([0], device=x.device).repeat(x.shape[0])
             action_features = self.action_encoder(action, timestep_action, embodiment_id)
             state_features = self.state_encoder(state, embodiment_id)
             action_register = torch.cat([action_features, state_features], dim=1)
@@ -1889,8 +1765,13 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             action_length = 0
             action_register_length = None
 
-        # time embeddings
-        timestep = timestep.unsqueeze(-1).expand(B, F, seq_len // F).reshape(B, -1)
+        # time embeddings: expand to exactly seq_len so e matches x (5B: frame_seqlen=50, 1 frame -> 50 tokens)
+        if F <= seq_len:
+            repeat = (seq_len + F - 1) // F
+            timestep = timestep.repeat_interleave(repeat, dim=1)[:, :seq_len]
+        else:
+            indices = torch.linspace(0, F - 1, seq_len, device=timestep.device, dtype=torch.long)
+            timestep = timestep[:, indices]
 
         if action is not None:
             assert timestep_action is not None
@@ -1914,21 +1795,6 @@ class CausalWanModel(ModelMixin, ConfigMixin):
 
         updated_kv_caches: list[torch.Tensor] = []
         for block_index, block in enumerate(self.blocks):
-            block_tome_info = None
-            if block.tome_r > 0 and kv_cache[block_index] is not None:
-                # Deterministic merge pattern — cached per block so it is
-                # consistent across diffusion steps (KV-cache compatible).
-                cache_key = (seq_len, block.tome_r, self.frame_seqlen, x.device)
-                if not hasattr(block, '_tome_info_cache'):
-                    block._tome_info_cache = {}
-                if cache_key not in block._tome_info_cache:
-                    block._tome_info_cache[cache_key] = compute_merge_indices_deterministic(
-                        N=seq_len, r=block.tome_r,
-                        frame_size=self.frame_seqlen,
-                        device=x.device, dtype=x.dtype,
-                    )
-                block_tome_info = block._tome_info_cache[cache_key]
-
             x, updated_kv_cache = block(
                 x=x,
                 e=e0,
@@ -1939,7 +1805,6 @@ class CausalWanModel(ModelMixin, ConfigMixin):
                 action_register_length=action_register_length,
                 kv_cache=kv_cache[block_index],
                 current_start_frame=current_start_frame,
-                tome_info=block_tome_info,
             )
             updated_kv_caches.append(updated_kv_cache)
 
@@ -2012,13 +1877,11 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         state,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
 
-        # Compute per-frame token count from input spatial dims and patch stride.
-        # x shape: [B, C, F, H, W], patch_size=(1,2,2) → tokens = F*(H//2)*(W//2)
-        F_dim = x.shape[2]
-        per_frame_tokens = (x.shape[3] // self.patch_size[1]) * (x.shape[4] // self.patch_size[2])
-        seq_len = per_frame_tokens * F_dim
+
+        frame_seqlen = 880
+        seq_len = 2*frame_seqlen 
         kv_cache_seq_len = kv_cache_packed.shape[3]
-        current_start_frame = kv_cache_seq_len // per_frame_tokens
+        current_start_frame =  kv_cache_seq_len // frame_seqlen
 
         kv_cache_list = []
         for block_index in range(len(self.blocks)):
@@ -2093,7 +1956,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             assert clip_feature is not None and y is not None
         assert context.shape[1] == self.text_len
 
-        if y is not None:
+        # Concat [x; y] only when pretrained that way (14B). 5B uses latent only, first-frame via CLIP.
+        if y is not None and self.concat_first_frame_latent:
             x = torch.cat([x, y.to(dtype=x.dtype)], dim=1)
 
         # embeddings
@@ -2104,14 +1968,6 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             grid_size=grid_size,
             start_frame=current_start_frame,
         )
-
-        # Profiling (first N calls)
-        _prof_count = getattr(self, '_prof_count', 0)
-        _do_prof = _prof_count < 3 or (_prof_count >= 50 and _prof_count < 53)
-        if _do_prof:
-            torch.cuda.synchronize()
-            import time as _time
-            _t_blocks_start = _time.perf_counter()
 
         x_video, action_noise_pred, updated_kv_caches = self._forward_blocks(
             x=x,
@@ -2127,15 +1983,6 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             kv_cache=kv_cache,
             current_start_frame=current_start_frame,
         )
-
-        if _do_prof:
-            torch.cuda.synchronize()
-            _t_blocks_end = _time.perf_counter()
-            _blocks_ms = (_t_blocks_end - _t_blocks_start) * 1000
-            _active_tome_r = max(getattr(block, 'tome_r', 0) for block in self.blocks)
-            _n_tokens = self.frame_seqlen - _active_tome_r if _active_tome_r > 0 else self.frame_seqlen
-            print(f"[Prof #{_prof_count}] _forward_blocks: {_blocks_ms:.1f}ms, tokens/frame={_n_tokens}")
-        self._prof_count = _prof_count + 1
 
         # Copy the updated KV caches back to the original KV cache.
         x_video = x_video.clone()
@@ -2187,7 +2034,8 @@ class CausalWanModel(ModelMixin, ConfigMixin):
         if self.model_type == 'i2v':
             assert clip_feature is not None and y is not None
 
-        if y is not None:
+        # Concat [x; y] only when pretrained that way (14B). 5B uses latent only, first-frame via CLIP.
+        if y is not None and self.concat_first_frame_latent:
             x = torch.cat([x, y.to(dtype=x.dtype)], dim=1)
 
         # embeddings
@@ -2247,7 +2095,7 @@ class CausalWanModel(ModelMixin, ConfigMixin):
             context = torch.cat([clip_embedding, context], dim=1)
 
         if clean_x is not None:
-            if y is not None:
+            if y is not None and self.concat_first_frame_latent:
                 clean_x = torch.cat([clean_x, y.to(dtype=clean_x.dtype)], dim=1)
             clean_x = self.patch_embedding(clean_x)
             clean_x = clean_x.flatten(start_dim=2).transpose(1, 2)
