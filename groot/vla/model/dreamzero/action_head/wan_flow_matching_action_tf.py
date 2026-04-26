@@ -1221,10 +1221,16 @@ class WANPolicyHead(ActionHead):
             self.ys = ys.to(dtype=image.dtype)
         elif getattr(self, '_need_reencode', False):
             # After KV sliding window: refresh CLIP/ys from current obs
-            # (KV cache kept, but visual conditioning must update).
-            clip_feas, ys, _ = self.encode_image(image, self.num_frames, height, width)
+            # (KV cache kept, but visual conditioning must update). Also save the
+            # single-frame latest-obs latent (encode_image's 3rd return) so the
+            # output prepend at end of forward() can use the CURRENT latest frame
+            # as the saved-video anchor instead of image[:, :1] (which would be
+            # the oldest of the multi-frame VAE encode latents — frame N-8 in the
+            # 9-frame buffer, ~64 sim-steps stale).
+            clip_feas, ys, latest_obs_latent = self.encode_image(image, self.num_frames, height, width)
             self.clip_feas = clip_feas.to(dtype=image.dtype)
             self.ys = ys.to(dtype=image.dtype)
+            self._latest_obs_latent = latest_obs_latent.transpose(1, 2)  # (B, 1, C, H', W')
             self._need_reencode = False
             if self.ip_rank == 0:
                 print("[KV slide] re-encoded CLIP/ys from current observation")
@@ -1547,15 +1553,18 @@ class WANPolicyHead(ActionHead):
         if self.current_start_frame == 1:
             output = torch.cat([image, output], dim=1)
         elif os.environ.get("USE_KVPRESS", "0") == "1" and self.current_start_frame != 0:
-            # Sliding mode: baseline runs reset->prefill every chunk, so csf==1 at
-            # this point and the clause above prepends the real observation as the
-            # first latent of video_pred (which is why baseline's pred first frame
-            # matches the real scene). In sliding mode csf keeps advancing past 1,
-            # the cat is skipped, and video_pred's first frame becomes the model's
-            # diffused output — manifests as "first frame distortion" per chunk.
-            # Prepend image[:, :1] (current obs VAE-encoded latent) to restore
-            # baseline semantics for sliding chunks >= 1.
-            output = torch.cat([image[:, :1], output], dim=1)
+            # Sliding mode: prepend the LATEST single-frame observation latent as
+            # video anchor. In csf!=0 path, `image` was overwritten by vae.encode
+            # of the full 9-frame buffer → 3 latents, where image[:, :1] is the
+            # OLDEST frame's encoding (~64 sim-steps stale). The decoded saved
+            # pred video would start with that old frame and the temporal jump
+            # to the new prediction creates incoherent first frames. Use the
+            # latest_obs_latent saved from encode_image instead (the actual
+            # current observation).
+            anchor = getattr(self, '_latest_obs_latent', None)
+            if anchor is None:
+                anchor = image[:, :1]
+            output = torch.cat([anchor, output], dim=1)
         self.current_start_frame += self.num_frame_per_block
 
         # Do torch.cuda.synchronize() to ensure all operations are completed before timing.
