@@ -1168,6 +1168,13 @@ class WANPolicyHead(ActionHead):
             print("language changed, reset current_start_frame to 0")
             self.current_start_frame = 0
             self.language = data["text"]
+        elif os.environ.get("FORCE_RESET_EVERY_CHUNK", "0") == "1":
+            # Diagnostic: force csf=0 reset every chunk regardless of sliding state.
+            # Effectively makes every chunk run init prefill (csf==0 path) instead of
+            # sliding's recondition path. Tests if "init prefill every chunk" is what
+            # makes baseline work. Compute cost should be similar (1 prefill + 16 main).
+            print("FORCE_RESET_EVERY_CHUNK=1: reset current_start_frame to 0")
+            self.current_start_frame = 0
         elif videos.shape[2] == 1 and not (os.environ.get("USE_KVPRESS", "0") == "1"):
             print("videos.shape[2] == 1, reset current_start_frame to 0")
             self.current_start_frame = 0
@@ -1302,18 +1309,71 @@ class WANPolicyHead(ActionHead):
 
         start_kv_event.record()
 
+        # Track whether multi-frame prefill ran this call (so we can skip the
+        # redundant recondition that would overwrite the same cache positions).
+        _did_multiframe_prefill = False
         if self.current_start_frame == 0:
-            timestep = torch.ones([batch_size, 1], device=noise_obs.device, dtype=torch.int64) * 0
+            # Multi-frame init prefill (MULTIFRAME_PREFILL=1): when caller has
+            # buffered the past N raw frames (videos.shape[2] >= 4), VAE-encode
+            # the full window (9 raw → 3 latent) and prefill cache positions
+            # 0..N-1 with REAL recent observation history instead of only the
+            # current single frame. Default (no env var) keeps the original
+            # 1-frame init prefill behaviour.
+            n_frames_prefill = 1
+            # noisy_input format expected by model: (B, C, T, H', W')
+            # `image` post line 1282 transpose is (B, 1, C, H', W'), so transpose
+            # back to (B, C, 1, H', W') for the single-frame default path.
+            prefill_obs = image.transpose(1, 2)
+            if (os.environ.get("MULTIFRAME_PREFILL", "0") == "1"
+                    and videos.shape[2] >= 4):
+                target_raw_frames = self.num_frame_per_block * 4 + 1  # 9
+                num_input_frames = videos.shape[2]
+                if (num_input_frames - 1) // 4 == self.num_frame_per_block:
+                    adj_videos = videos
+                elif num_input_frames < self.num_frame_per_block * 2:
+                    # Truly degenerate: <4 raw frames buffered. Fall back to
+                    # last-frame replication (acts as single-frame prefill).
+                    adj_videos = videos[:, :, -1:].repeat(1, 1, target_raw_frames, 1, 1)
+                elif videos.shape[2] // 4 != self.num_frame_per_block:
+                    repeat_factor = self.num_frame_per_block // (videos.shape[2] // 4)
+                    adj_videos = torch.repeat_interleave(videos, repeat_factor, dim=2)
+                    first_frame = adj_videos[:, :, 0:1]
+                    adj_videos = torch.cat([first_frame, adj_videos], dim=2)
+                else:
+                    first_frame = videos[:, :, 0:1]
+                    adj_videos = torch.cat([first_frame, videos], dim=2)
+                multi_image = self.vae.encode(
+                    adj_videos,
+                    tiled=self.tiled,
+                    tile_size=(self.tile_size_height, self.tile_size_width),
+                    tile_stride=(self.tile_stride_height, self.tile_stride_width),
+                )
+                # multi_image: (B, C, T_latent, H', W'), T_latent = 1+(9-1)/4 = 3.
+                prefill_obs = multi_image
+                n_frames_prefill = multi_image.shape[2]
+                # NOTE: do NOT overwrite `image` here. `image` holds the
+                # single-frame latent of the LATEST observation (from
+                # encode_image at line 1219, anchored on videos[:, :, -1:] for
+                # shape==9). It is reused at the end of forward() to prepend a
+                # "current scene" anchor frame to the output video. Overwriting
+                # it with multi_image[:, 0] (oldest frame) would make the saved
+                # pred video start with a stale frame from N sim-steps ago.
+                # Recondition is skipped via _did_multiframe_prefill, so we
+                # don't need image to hold the multi-frame latents anyway.
+                _did_multiframe_prefill = True
+                if self.ip_rank == 0:
+                    print(f"[MULTIFRAME_PREFILL] {n_frames_prefill} latent frames from {num_input_frames}-frame buffer")
+            timestep = torch.ones([batch_size, n_frames_prefill], device=noise_obs.device, dtype=torch.int64) * 0
             self._run_diffusion_steps(
-                noisy_input=image.transpose(1, 2),
+                noisy_input=prefill_obs,
                 timestep=timestep * 0,
                 action=None,
                 timestep_action=None,
                 state=None,
                 embodiment_id=None,
                 context=prompt_embs,
-                seq_len=frame_seqlen,
-                y=self.ys[:, :, 0:1],
+                seq_len=frame_seqlen * n_frames_prefill,
+                y=self.ys[:, :, 0:n_frames_prefill],
                 clip_feature=self.clip_feas,
                 kv_caches=kv_caches,
                 crossattn_caches=crossattn_caches,
@@ -1322,8 +1382,8 @@ class WANPolicyHead(ActionHead):
                     update_kv_cache=True,
                 ),
             )
-            self.current_start_frame += 1
-            
+            self.current_start_frame += n_frames_prefill
+
         timestep = torch.ones([batch_size, self.num_frame_per_block], device=noise_obs.device, dtype=torch.int64) * 0
 
         # SLIDE_SKIP_RECONDITION=1: in sliding mode, skip the recondition block
@@ -1331,7 +1391,10 @@ class WANPolicyHead(ActionHead):
         # sliding match baseline's "no recondition overwrite" behavior.
         _skip_recond = (os.environ.get("USE_KVPRESS", "0") == "1"
                         and os.environ.get("SLIDE_SKIP_RECONDITION", "0") == "1")
-        if self.current_start_frame != 1 and not _skip_recond:
+        # When multi-frame prefill just populated positions 0..N-1 with real
+        # observation latents, a recondition pass would redundantly overwrite
+        # the last npfb of those positions. Skip it.
+        if self.current_start_frame != 1 and not _skip_recond and not _did_multiframe_prefill:
             current_ref_latents = image[:, -self.num_frame_per_block:]
             # SLIDE_RECOND_Y_HEAD=1: use ys[:, :, 0:npfb] (pos 0 has msk=1 real
             # signal + pos 1 zero-pad) instead of the zero-pad-only slice at

@@ -90,8 +90,27 @@ class DreamZeroPolicy(BasePolicy):
         # Compare mode state
         self._last_video_pred = None  # saved for next chunk's async comparison
 
+        # Frame buffering — mirrors clean ARDroidRoboarenaPolicy behavior so the
+        # action_head receives videos.shape[2] = FRAMES_PER_CHUNK (default 4)
+        # instead of a single frame each chunk. Provides real temporal diversity
+        # to recondition VAE input + KV cache content.
+        # FRAMES_PER_CHUNK=1 disables buffering (legacy single-frame behavior).
+        self.FRAMES_PER_CHUNK = int(os.environ.get("FRAMES_PER_CHUNK", "4"))
+        self._frame_buffers: dict[str, list] = {
+            "video.exterior_image_1_left":  [],
+            "video.exterior_image_2_left":  [],
+            "video.wrist_image_left":       [],
+        }
+        self._is_first_call = True
+        logger.info(f"Frame buffering: FRAMES_PER_CHUNK={self.FRAMES_PER_CHUNK}")
+
     def _build_policy_obs(self, obs: dict):
-        """Build model input dict from client obs."""
+        """Build model input dict from client obs.
+
+        Uses frame buffering: appends current frame to each per-camera buffer,
+        then sends the most recent FRAMES_PER_CHUNK frames as (T, H, W, 3) arrays.
+        First call sends T=1, subsequent calls send T=FRAMES_PER_CHUNK.
+        """
         instruction = obs.get("prompt", "pick up the object")
         jp = obs["observation/joint_position"]
         gp = obs["observation/gripper_position"]
@@ -99,10 +118,43 @@ class DreamZeroPolicy(BasePolicy):
             jp = jp[np.newaxis, :]
         if gp.ndim == 1:
             gp = gp[np.newaxis, :]
+
+        # Reset buffers on episode boundary (client sends reset_episode=True at chunk 0)
+        if obs.get("reset_episode", False):
+            for k in self._frame_buffers:
+                self._frame_buffers[k].clear()
+            self._is_first_call = True
+
+        # Append latest frame from each camera
+        cam_inputs = {
+            "video.exterior_image_1_left":  obs["observation/exterior_image_0_left"],
+            "video.exterior_image_2_left":  obs["observation/exterior_image_1_left"],
+            "video.wrist_image_left":       obs["observation/wrist_image_left"],
+        }
+        for k, img in cam_inputs.items():
+            self._frame_buffers[k].append(img)
+
+        # Determine how many frames to send to the model this chunk
+        if self._is_first_call or self.FRAMES_PER_CHUNK == 1:
+            num_frames = 1
+            self._is_first_call = False
+        else:
+            num_frames = self.FRAMES_PER_CHUNK
+
+        videos: dict = {}
+        for k, buf in self._frame_buffers.items():
+            if len(buf) >= num_frames:
+                frames = buf[-num_frames:]
+            else:
+                frames = list(buf)
+                while len(frames) < num_frames:
+                    frames.insert(0, buf[0])
+            videos[k] = np.stack(frames, axis=0) if num_frames > 1 else frames[0]
+
         return {
-            "video.exterior_image_1_left":   obs["observation/exterior_image_0_left"],
-            "video.exterior_image_2_left":   obs["observation/exterior_image_1_left"],
-            "video.wrist_image_left":        obs["observation/wrist_image_left"],
+            "video.exterior_image_1_left":   videos["video.exterior_image_1_left"],
+            "video.exterior_image_2_left":   videos["video.exterior_image_2_left"],
+            "video.wrist_image_left":        videos["video.wrist_image_left"],
             "state.joint_position":          jp,
             "state.gripper_position":        gp,
             "annotation.language.language_instruction":   instruction,
