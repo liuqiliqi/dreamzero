@@ -96,13 +96,213 @@ class DreamZeroPolicy(BasePolicy):
         # to recondition VAE input + KV cache content.
         # FRAMES_PER_CHUNK=1 disables buffering (legacy single-frame behavior).
         self.FRAMES_PER_CHUNK = int(os.environ.get("FRAMES_PER_CHUNK", "4"))
+        # ASYNC_LAG_CHUNKS=N simulates async inference: model sees obs from N
+        # chunks ago (i.e. one chunk's actions are conceptually still executing
+        # while this prediction runs). Lags BOTH video buffer and joint/gripper
+        # state. Default 0 = sync.
+        self.ASYNC_LAG_CHUNKS = int(os.environ.get("ASYNC_LAG_CHUNKS", "0"))
+        # ASYNC_PRED_AS_OBS=1: at each inference, replace the LATEST entry of
+        # the model's input video buffer with the last frame of the previously
+        # predicted video (split per camera from the 2x2 composite). Older
+        # entries remain real obs. Effectively: model uses its own prior
+        # prediction as a stand-in for "obs at the moment we are predicting"
+        # (matches true-async semantics where the prior chunk's actions are
+        # still executing). Each subsequent chunk naturally "corrects" the
+        # prior pred-stand-in by shifting it back into the real-obs region.
+        self.ASYNC_PRED_AS_OBS = int(os.environ.get("ASYNC_PRED_AS_OBS", "0"))
+        self._last_pred_composite = None  # last decoded pred frame (H, W, 3) uint8
         self._frame_buffers: dict[str, list] = {
             "video.exterior_image_1_left":  [],
             "video.exterior_image_2_left":  [],
             "video.wrist_image_left":       [],
         }
+        self._state_buffers: dict[str, list] = {"jp": [], "gp": []}
         self._is_first_call = True
-        logger.info(f"Frame buffering: FRAMES_PER_CHUNK={self.FRAMES_PER_CHUNK}")
+        logger.info(f"Frame buffering: FRAMES_PER_CHUNK={self.FRAMES_PER_CHUNK} ASYNC_LAG_CHUNKS={self.ASYNC_LAG_CHUNKS} ASYNC_PRED_AS_OBS={self.ASYNC_PRED_AS_OBS}")
+
+    def _split_pred_composite(self, composite, target_h, target_w):
+        """Split a (H_comp, W_comp, 3) pred composite back into 3 camera views.
+
+        Composite layout (from dreamzero_cotrain._prepare_video DROID branch):
+          - Top half [0:H, :]:   wrist, stretched 2x wider via np.repeat axis=-1
+          - Bottom-left [H:, :W]: left exterior  (eval's exterior_image_0_left)
+          - Bottom-right [H:, W:]: right exterior (eval's exterior_image_1_left)
+
+        Returns dict with keys matching eval's observation/* names, each
+        resized to (target_h, target_w, 3).
+        """
+        import numpy as np
+        from PIL import Image
+
+        H_comp, W_comp = composite.shape[:2]
+        h, w = H_comp // 2, W_comp // 2
+
+        # Wrist: top half, sample every other column to undo 2x stretch
+        wrist = composite[:h, ::2, :]   # (h, w, 3)
+        # Bottom-left = left exterior (= eval's exterior_image_0_left per serve_dreamzero header)
+        left_ext = composite[h:, :w, :]
+        # Bottom-right = right exterior (= eval's exterior_image_1_left)
+        right_ext = composite[h:, w:, :]
+
+        def _resize(img, h_out, w_out):
+            if img.shape[:2] == (h_out, w_out):
+                return img
+            return np.array(Image.fromarray(img).resize((w_out, h_out), Image.BILINEAR))
+
+        return {
+            "observation/exterior_image_0_left": _resize(left_ext, target_h, target_w),
+            "observation/exterior_image_1_left": _resize(right_ext, target_h, target_w),
+            "observation/wrist_image_left":      _resize(wrist, target_h, target_w),
+        }
+
+    def _decode_pred_last_frame(self, video_pred):
+        """Decode VAE latent to pixel composite, return last frame as uint8."""
+        action_head = self.policy.trained_model.action_head
+        with torch.no_grad():
+            frames = action_head.vae.decode(
+                video_pred,
+                tiled=action_head.tiled,
+                tile_size=(action_head.tile_size_height, action_head.tile_size_width),
+                tile_stride=(action_head.tile_stride_height, action_head.tile_stride_width),
+            )
+        frames = rearrange(frames, "B C T H W -> B T H W C")
+        frames = ((frames[0].float() + 1) * 127.5).clamp(0, 255).cpu().numpy().astype(np.uint8)
+        return frames[-1].copy()
+
+    def _add_label(self, frame, label):
+        """Overlay a colored corner rectangle with text label on a frame."""
+        try:
+            from PIL import Image, ImageDraw, ImageFont
+        except Exception:
+            return frame
+        img = Image.fromarray(frame)
+        draw = ImageDraw.Draw(img)
+        fill_color = {
+            "A": (220, 60, 60),    # red = sync inference (step A)
+            "B": (60, 200, 60),    # green = final 2-step output (step B)
+            "T": (60, 100, 220),   # blue = truth (ground-truth episode slice)
+            "I": (200, 160, 50),   # amber = input buffer to forward A
+            "J": (180, 120, 200),  # purple = input buffer to forward B
+        }.get(label, (100, 100, 200))
+        rect_w, rect_h = 80, 50
+        draw.rectangle([0, 0, rect_w, rect_h], fill=fill_color)
+        font = None
+        for fp in ("/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+                   "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"):
+            try:
+                font = ImageFont.truetype(fp, 36)
+                break
+            except Exception:
+                continue
+        if font is None:
+            font = ImageFont.load_default()
+        draw.text((22, 4), label, fill=(255, 255, 255), font=font)
+        return np.array(img)
+
+    def _save_truth_video(self, policy_obs, filename, label="T"):
+        """Save the 3-camera buffer in policy_obs as a 2x2 composite mp4 that
+        mirrors the model's _prepare_video DROID layout (wrist top stretched,
+        left+right exterior bottom). Handles both 4D (multi-frame) and 3D
+        (single-frame, after short-buffer fallback) inputs."""
+        try:
+            left_ext = policy_obs.get("video.exterior_image_1_left")
+            right_ext = policy_obs.get("video.exterior_image_2_left")
+            wrist = policy_obs.get("video.wrist_image_left")
+            if left_ext is None:
+                return
+            if left_ext.ndim == 3:
+                # Single-frame mode: lift to (T=1, H, W, 3)
+                left_ext = left_ext[None]
+                right_ext = right_ext[None]
+                wrist = wrist[None]
+            elif left_ext.ndim != 4:
+                return
+            T, H, W, _ = left_ext.shape
+            comp = np.zeros((T, 2 * H, 2 * W, 3), dtype=np.uint8)
+            comp[:, :H, :, :] = np.repeat(wrist, 2, axis=2)   # wrist stretched 2x wide
+            comp[:, H:, :W, :] = left_ext                      # bottom-left
+            comp[:, H:, W:, :] = right_ext                     # bottom-right
+            if label is not None:
+                comp = np.stack([self._add_label(f, label) for f in comp], axis=0)
+            out_path = os.path.join(self.video_out_dir, filename)
+            imageio.mimsave(out_path, list(comp), fps=15, codec="libx264")
+            logger.info(f"[truth video] saved {len(comp)} frames (label={label}) → {out_path}")
+        except Exception as e:
+            logger.warning(f"[truth video] failed: {e}")
+
+    def _save_pred_video_named(self, video_pred, filename, label=None):
+        """Decode + save a pred video under a custom filename. Optionally overlay
+        a colored A/B label in the top-left corner of every frame. Returns the
+        UNLABELED last frame (so callers can use it for split/swap)."""
+        if video_pred is None:
+            return None
+        try:
+            action_head = self.policy.trained_model.action_head
+            with torch.no_grad():
+                frames = action_head.vae.decode(
+                    video_pred,
+                    tiled=action_head.tiled,
+                    tile_size=(action_head.tile_size_height, action_head.tile_size_width),
+                    tile_stride=(action_head.tile_stride_height, action_head.tile_stride_width),
+                )
+            frames = rearrange(frames, "B C T H W -> B T H W C")
+            frames = ((frames[0].float() + 1) * 127.5).clamp(0, 255).cpu().numpy().astype(np.uint8)
+            last_frame_unlabeled = frames[-1].copy()
+            if label is not None:
+                frames = np.stack([self._add_label(f, label) for f in frames], axis=0)
+            out_path = os.path.join(self.video_out_dir, filename)
+            imageio.mimsave(out_path, list(frames), fps=15, codec="libx264")
+            logger.info(f"[pred video] saved {len(frames)} frames (label={label}) → {out_path}")
+            return last_frame_unlabeled
+        except Exception as e:
+            logger.warning(f"[pred video named={filename}] failed: {e}")
+            return None
+
+    def _swap_latest_to_pred(self, policy_obs, pred_composite):
+        """Return a new policy_obs dict where the video buffer's "current" entry
+        is replaced with pred_composite (split per camera).
+
+        Two cases:
+          - 4D buffer (multi-frame, T>=1): SHIFT LEFT by 1, append pred at end.
+            Keeps adjacent entries 1-chunk apart so VAE temporal compression
+            doesn't see a spurious "acceleration".
+          - 3D buffer (single-frame fallback after short-buffer): replace the
+            single frame entirely with split pred.
+        """
+        ref = policy_obs["video.exterior_image_1_left"]
+        if ref.ndim == 4 and ref.shape[0] >= 1:
+            tgt_h, tgt_w = ref.shape[1], ref.shape[2]
+            mode = "multi"
+        elif ref.ndim == 3:
+            tgt_h, tgt_w = ref.shape[0], ref.shape[1]
+            mode = "single"
+        else:
+            return policy_obs
+        split = self._split_pred_composite(pred_composite, tgt_h, tgt_w)
+        mapping = {
+            "video.exterior_image_1_left":  split["observation/exterior_image_0_left"],
+            "video.exterior_image_2_left":  split["observation/exterior_image_1_left"],
+            "video.wrist_image_left":       split["observation/wrist_image_left"],
+        }
+        new_obs = dict(policy_obs)
+        for k, frame in mapping.items():
+            if mode == "multi":
+                stacked = new_obs[k]
+                new_obs[k] = np.concatenate([stacked[1:], frame[None]], axis=0)
+            else:  # single
+                new_obs[k] = frame
+        # Optional debug dump
+        if os.environ.get("DUMP_SPLIT_PRED", "0") == "1":
+            try:
+                debug_dir = os.path.join(self.video_out_dir, "split_debug")
+                os.makedirs(debug_dir, exist_ok=True)
+                idx = self._infer_count
+                imageio.imwrite(os.path.join(debug_dir, f"chunk{idx:05d}_composite.png"), pred_composite)
+                for k, img in mapping.items():
+                    imageio.imwrite(os.path.join(debug_dir, f"chunk{idx:05d}_{k.replace('.', '_')}.png"), img)
+            except Exception as e:
+                logger.warning(f"[DUMP_SPLIT_PRED] failed: {e}")
+        return new_obs
 
     def _build_policy_obs(self, obs: dict):
         """Build model input dict from client obs.
@@ -123,7 +323,10 @@ class DreamZeroPolicy(BasePolicy):
         if obs.get("reset_episode", False):
             for k in self._frame_buffers:
                 self._frame_buffers[k].clear()
+            for k in self._state_buffers:
+                self._state_buffers[k].clear()
             self._is_first_call = True
+            self._last_pred_composite = None
 
         # Append latest frame from each camera
         cam_inputs = {
@@ -133,6 +336,8 @@ class DreamZeroPolicy(BasePolicy):
         }
         for k, img in cam_inputs.items():
             self._frame_buffers[k].append(img)
+        self._state_buffers["jp"].append(jp)
+        self._state_buffers["gp"].append(gp)
 
         # Determine how many frames to send to the model this chunk
         if self._is_first_call or self.FRAMES_PER_CHUNK == 1:
@@ -141,22 +346,54 @@ class DreamZeroPolicy(BasePolicy):
         else:
             num_frames = self.FRAMES_PER_CHUNK
 
+        buf_len = len(self._frame_buffers["video.exterior_image_1_left"])
+
+        # _build_policy_obs always produces SYNC-style obs (latest real at [-1]).
+        # ASYNC_PRED_AS_OBS=1 is handled at the handler level via 2-step inference
+        # (run sync to get fresh pred_A, then re-run with pred_A_last at [-1]).
+        # ASYNC_LAG_CHUNKS=N still applies as a naive baseline (drop latest N obs).
+        lag = self.ASYNC_LAG_CHUNKS
+
+        # Short-buffer fallback (only in ASYNC_PRED_AS_OBS mode): when buf has
+        # fewer than num_frames+lag entries the slicing+padding produces an OOD
+        # buffer (mostly identical T_0). Forward A on that input falls outside
+        # the model's training distribution. Fall back to single-frame mode
+        # (num_frames=1) — same path as sync chunk 0, in-distribution.
+        if (self.ASYNC_PRED_AS_OBS == 1 and num_frames > 1
+                and buf_len < num_frames + lag):
+            num_frames = 1
+
+        if lag > 0 and buf_len > lag:
+            window_end = -lag
+            window_start = window_end - num_frames
+        else:
+            window_end = None
+            window_start = -num_frames
+
         videos: dict = {}
         for k, buf in self._frame_buffers.items():
-            if len(buf) >= num_frames:
-                frames = buf[-num_frames:]
+            sliced = buf[window_start:window_end] if window_end is not None else buf[-num_frames:]
+            if len(sliced) >= num_frames:
+                frames = list(sliced)
             else:
-                frames = list(buf)
+                frames = list(sliced)
                 while len(frames) < num_frames:
-                    frames.insert(0, buf[0])
+                    frames.insert(0, sliced[0] if sliced else buf[0])
             videos[k] = np.stack(frames, axis=0) if num_frames > 1 else frames[0]
+
+        if window_end is not None:
+            jp_send = self._state_buffers["jp"][window_end - 1]
+            gp_send = self._state_buffers["gp"][window_end - 1]
+        else:
+            jp_send = jp
+            gp_send = gp
 
         return {
             "video.exterior_image_1_left":   videos["video.exterior_image_1_left"],
             "video.exterior_image_2_left":   videos["video.exterior_image_2_left"],
             "video.wrist_image_left":        videos["video.wrist_image_left"],
-            "state.joint_position":          jp,
-            "state.gripper_position":        gp,
+            "state.joint_position":          jp_send,
+            "state.gripper_position":        gp_send,
             "annotation.language.language_instruction":   instruction,
             "annotation.language.language_instruction_2": instruction,
             "annotation.language.language_instruction_3": instruction,
@@ -261,6 +498,7 @@ class DreamZeroPolicy(BasePolicy):
         # Allow client to reset server state at episode boundaries
         if obs.get("reset_episode", False):
             self._last_video_pred = None
+            self._last_pred_composite = None
             logger.info("[reset_episode] Cleared _last_video_pred for new episode")
 
         # Allow client to switch output directory per run without restarting server
@@ -290,7 +528,42 @@ class DreamZeroPolicy(BasePolicy):
 
         t_async = time.perf_counter()
 
-        if predicted_mode and self._last_video_pred is not None:
+        # ASYNC_PRED_AS_OBS=1: 2-step inference per chunk.
+        #   A) Run sync forward on real-obs buffer → pred_A (fresh lookahead).
+        #   B) Replace [-1] of buffer with pred_A's last decoded frame (split per
+        #      camera) → run forward again → pred_B + actions to send.
+        # Pred_A is always FRESH from current real obs each chunk (no chaining
+        # of pred → pred → pred which would compound errors).
+        # Falls back to sync on chunk 0 (buffer too short to be meaningful).
+        do_async_two_step = (self.ASYNC_PRED_AS_OBS == 1
+                             and len(self._frame_buffers["video.exterior_image_1_left"]) > 1)
+
+        two_step_did_run = False
+        if do_async_two_step:
+            # Save forward A's input buffer (9 real obs) as "I" labeled composite.
+            self._save_truth_video(
+                policy_obs, f"pred_{self._infer_count:05d}_I.mp4", label="I"
+            )
+            # --- Step A: sync inference for fresh lookahead ---
+            result_A, pred_A = self._run_forward(policy_obs)
+            # Save pred_A video with "A" label and pred_A's action set with _A suffix.
+            pred_A_last = self._save_pred_video_named(
+                pred_A, f"pred_{self._infer_count:05d}_A.mp4", label="A"
+            )
+            actions_A = self._extract_actions(result_A)
+            self._save_actions(actions_A, idx=self._infer_count, suffix="_A")
+            self._last_pred_composite = pred_A_last  # debug visibility
+            # --- Step B: re-inference with pred_A_last replacing [-1] ---
+            policy_obs_async = self._swap_latest_to_pred(policy_obs, pred_A_last)
+            # Save forward B's input buffer with "J" label for analysis
+            # (= I shifted left by 1 + pred_A_last appended at end).
+            self._save_truth_video(
+                policy_obs_async, f"pred_{self._infer_count:05d}_J.mp4", label="J"
+            )
+            result_batch, video_pred = self._run_forward(policy_obs_async)
+            two_step_did_run = True
+            logger.info("[async_two_step] step A (sync→pred_A) + step B (pred_A→final) done")
+        elif predicted_mode and self._last_video_pred is not None:
             # === Predicted mode: use latent_video at non-reset chunks ===
             # At csf=0 (reset), pass None so real observation is used (static frame).
             ah = self.policy.trained_model.action_head
@@ -313,8 +586,17 @@ class DreamZeroPolicy(BasePolicy):
         # Save video_pred for next chunk
         self._last_video_pred = video_pred
 
-        # Decode and save AI prediction video
-        self._save_pred_video(video_pred)
+        # Decode and save AI prediction video. In 2-step async mode, save the
+        # final (B) under the canonical pred_NNNNN.mp4 name with a "B" label;
+        # pred_A was already saved above with an "A" label. Otherwise use the
+        # standard unlabeled save.
+        if two_step_did_run:
+            self._save_pred_video_named(
+                video_pred, f"pred_{self._infer_count:05d}.mp4", label="B"
+            )
+            self._infer_count += 1  # mirror _save_pred_video's auto-increment
+        else:
+            self._save_pred_video(video_pred)
         t_pred_video = time.perf_counter()
 
         # Save full action array alongside prediction video
@@ -354,6 +636,11 @@ class DreamZeroPolicy(BasePolicy):
             frames = rearrange(frames, "B C T H W -> B T H W C")
             frames = ((frames[0].float() + 1) * 127.5).clamp(0, 255).cpu().numpy().astype(np.uint8)
 
+            # Save LAST frame of the decoded pred composite for ASYNC_PRED_AS_OBS.
+            # Layout: top half = wrist (2x wide), bottom-left = left exterior,
+            # bottom-right = right exterior (per dreamzero_cotrain._prepare_video).
+            self._last_pred_composite = frames[-1].copy()
+
             out_path = os.path.join(self.video_out_dir, f"pred_{self._infer_count:05d}.mp4")
             imageio.mimsave(out_path, list(frames), fps=15, codec="libx264")
             logger.info(f"[pred video] saved {len(frames)} frames → {out_path}")
@@ -362,19 +649,26 @@ class DreamZeroPolicy(BasePolicy):
         finally:
             self._infer_count += 1
 
-    def _save_actions(self, actions: np.ndarray) -> None:
-        """Save full action array (H, 8) as .npy and human-readable .txt."""
-        idx = self._infer_count - 1  # _infer_count already incremented in _save_pred_video
+    def _save_actions(self, actions: np.ndarray, idx: int = None, suffix: str = "") -> None:
+        """Save full action array (H, 8) as .npy and human-readable .txt.
+
+        Args:
+            idx: chunk index. If None, uses self._infer_count - 1 (legacy: assumes
+                _save_pred_video already incremented).
+            suffix: filename suffix (e.g. '_A' for forward A's action set).
+        """
+        if idx is None:
+            idx = self._infer_count - 1
         try:
-            npy_path = os.path.join(self.video_out_dir, f"pred_{idx:05d}_actions.npy")
-            txt_path = os.path.join(self.video_out_dir, f"pred_{idx:05d}_actions.txt")
+            npy_path = os.path.join(self.video_out_dir, f"pred_{idx:05d}{suffix}_actions.npy")
+            txt_path = os.path.join(self.video_out_dir, f"pred_{idx:05d}{suffix}_actions.txt")
 
             np.save(npy_path, actions)
 
             # Human-readable: header + rows
             H = actions.shape[0]
             with open(txt_path, "w") as f:
-                f.write(f"# chunk {idx:05d}  shape=({H}, 8)\n")
+                f.write(f"# chunk {idx:05d}{suffix}  shape=({H}, 8)\n")
                 f.write(f"# cols: j0  j1  j2  j3  j4  j5  j6  gripper\n")
                 for step, row in enumerate(actions):
                     vals = "  ".join(f"{v:+.4f}" for v in row)
@@ -383,7 +677,7 @@ class DreamZeroPolicy(BasePolicy):
             # Also log gripper column to server log for quick inspection
             gripper_vals = actions[:, -1]
             logger.info(
-                f"[actions {idx:05d}] gripper={np.array2string(gripper_vals, precision=3, separator=',')}  "
+                f"[actions {idx:05d}{suffix}] gripper={np.array2string(gripper_vals, precision=3, separator=',')}  "
                 f"joint_mean={actions[:, :7].mean(axis=0)}"
             )
         except Exception as e:
