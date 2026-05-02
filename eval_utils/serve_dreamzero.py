@@ -111,6 +111,90 @@ class DreamZeroPolicy(BasePolicy):
         # prior pred-stand-in by shifting it back into the real-obs region.
         self.ASYNC_PRED_AS_OBS = int(os.environ.get("ASYNC_PRED_AS_OBS", "0"))
         self._last_pred_composite = None  # last decoded pred frame (H, W, 3) uint8
+        # ASYNC_QUEUE=1 + ASYNC_PRED_AS_OBS=1: properly time-shift B's actions.
+        # B predicts the chunk AFTER the current one; queue it so it gets
+        # returned at the next infer call (= applied at chunk K+1 window).
+        # Chunk 0 falls back to sync (no pending yet).
+        self.ASYNC_QUEUE = int(os.environ.get("ASYNC_QUEUE", "0"))
+        self._pending_actions = None     # queued actions to return next call
+        self._pending_video_pred = None  # queued video latent (saved as pred_NNNNN.mp4 next call)
+        # ASYNC_FALLBACK_SQ_THRESH: if sum_j (A_K[0, j] - prev_B[-1, j])^2 > threshold,
+        # fall back to A_K (not B_shifted) for this chunk. Detects severe A↔prev-B
+        # disagreement which signals B's OOD bias is too large for shift to fix.
+        # Default 1e9 = effectively disabled.
+        self.ASYNC_FALLBACK_SQ_THRESH = float(os.environ.get("ASYNC_FALLBACK_SQ_THRESH", "1e9"))
+        # B_AMPLITUDE_SCALE=1: stretch B's per-chunk per-joint amplitude to match
+        # A's slope at the chunk boundary. scale_j = vA / vB, where with window W,
+        # vA = A[-1,j]-A[-1-W,j] and vB = B[W,j]-B[0,j]. W=1 = single-step (noisy);
+        # W=3 = 3-step finite diff (smoother, suppresses scale outliers).
+        # Applied as B_new[:, j] = B[0, j] + (B[:, j] - B[0, j]) * scale_j, then clip
+        # the resulting delta to ±A_range_j (so B can't be wilder than A).
+        self.B_AMPLITUDE_SCALE = int(os.environ.get("B_AMPLITUDE_SCALE", "0"))
+        self.B_AMPLITUDE_SCALE_WINDOW = int(os.environ.get("B_AMPLITUDE_SCALE_WINDOW", "1"))
+        # FORCE_PAUSE_EVERY_N: bypass ASYNC_FALLBACK_SQ_THRESH; force a pause
+        # every N two-step entries since the last pause. After a pause, the next
+        # chunk runs SYNC (chunk-0-like) and the counter resets. 0 = disabled.
+        self.FORCE_PAUSE_EVERY_N = int(os.environ.get("FORCE_PAUSE_EVERY_N", "0"))
+        self._two_step_count_since_pause = 0
+        # GRIP_TRANSITION_PAUSE: when the current chunk's gripper command goes
+        # from open (<=0.2) to closed (>0.2), force a pause on the NEXT chunk.
+        # Reason: the open→closed transition = grasping moment. Right after,
+        # (a) wrist camera view changes drastically (object now in gripper),
+        # (b) sim PID needs settling time for the gripper to physically close,
+        # (c) PD1's prior bias was learned on "not holding object" dynamics.
+        # The pause + chunk-0-like restart gives the next plan fresh real-obs
+        # of "holding object" state to start from.
+        self.GRIP_TRANSITION_PAUSE = int(os.environ.get("GRIP_TRANSITION_PAUSE", "1"))
+        self._pending_grip_pause = False
+        # GRIP_PRE_PAUSE: A (lagged real-obs) predicted gripper close anywhere
+        # in chunk K-1 but actual prev_applied gripper ended open → A reports
+        # a missed grasp. Pause this chunk to fix and prevent error buildup.
+        self.GRIP_PRE_PAUSE = int(os.environ.get("GRIP_PRE_PAUSE", "1"))
+        self._prev_applied_last_gripper = None
+        # GRIP_B_ABORT: in two-step path, if current chunk's B raw plan is
+        # open→close (a grasp attempt), abort this chunk (hold-still) and let
+        # the next post-pause chunk-0-like sync handle the grasp. Principle:
+        # only post-pause sync chunks should perform grasp actions, never
+        # async two-step chunks (whose B is corrupted by VAE round-trip).
+        self.GRIP_B_ABORT = int(os.environ.get("GRIP_B_ABORT", "1"))
+        # DISTILL_MODEL_PATH: path to a trained ResidualConv1D checkpoint that
+        # corrects B_raw using a learned VAE-bias residual. If set, applied in
+        # two-step path before shift+scale+PD1. Replaces PD1 mechanism.
+        self._distill_model = None
+        distill_path = os.environ.get("DISTILL_MODEL_PATH", "").strip()
+        if distill_path and os.path.exists(distill_path):
+            try:
+                import sys
+                sys.path.insert(0, "/fact_home/qiliu/worldmodel/distill")
+                from model import ResidualConv1D
+                ckpt = torch.load(distill_path, map_location="cpu", weights_only=False)
+                margs = ckpt.get("args", {})
+                self._distill_model = ResidualConv1D(
+                    in_ch=24, hid=margs.get("hid", 64),
+                    out_ch=7, n_layers=margs.get("n_layers", 3))
+                self._distill_model.load_state_dict(ckpt["state_dict"])
+                self._distill_model.eval()
+                logger.info(f"[distill] loaded model from {distill_path} "
+                            f"(val_mse={ckpt.get('val_mse', '?')}, ep={ckpt.get('epoch', '?')})")
+            except Exception as e:
+                logger.warning(f"[distill] failed to load model: {e}")
+                self._distill_model = None
+        # B_PREV_DIFF_ALPHA: residual correction using (A_K - B_{K-1}) carried
+        # from the previous chunk. Both A_K and B_{K-1} predict chunk K-1; the
+        # diff is the VAE round-trip bias on chunk K-1. Apply alpha * diff to
+        # B_K (current chunk) on dims 0..6 (gripper untouched).
+        self.B_PREV_DIFF_ALPHA = float(os.environ.get("B_PREV_DIFF_ALPHA", "0.0"))
+        self._prev_applied_full = None   # last applied chunk's full action array (H,8)
+        # RELATIVE_ACTION_SCALE: amplify per-chunk relative joint actions before
+        # returning. action_t' = current_jp + s * (action_t - current_jp), applied
+        # to j0..j6 only. gripper untouched. 1.0 = identity. Tests hypothesis that
+        # model under-shoots actual motion magnitude.
+        self.RELATIVE_ACTION_SCALE = float(os.environ.get("RELATIVE_ACTION_SCALE", "1.0"))
+        self._prev_applied_last = None   # last step of last applied chunk's actions (j0..j6)
+        # When fallback triggers, we emit hold-still actions and set this flag so the
+        # NEXT chunk acts like chunk 0: clear frame/state buffers, single-frame mode,
+        # no lag. KV cache is anyway reset every chunk under FORCE_RESET_EVERY_CHUNK=1.
+        self._pending_reset = False
         self._frame_buffers: dict[str, list] = {
             "video.exterior_image_1_left":  [],
             "video.exterior_image_2_left":  [],
@@ -118,7 +202,7 @@ class DreamZeroPolicy(BasePolicy):
         }
         self._state_buffers: dict[str, list] = {"jp": [], "gp": []}
         self._is_first_call = True
-        logger.info(f"Frame buffering: FRAMES_PER_CHUNK={self.FRAMES_PER_CHUNK} ASYNC_LAG_CHUNKS={self.ASYNC_LAG_CHUNKS} ASYNC_PRED_AS_OBS={self.ASYNC_PRED_AS_OBS}")
+        logger.info(f"Frame buffering: FRAMES_PER_CHUNK={self.FRAMES_PER_CHUNK} ASYNC_LAG_CHUNKS={self.ASYNC_LAG_CHUNKS} ASYNC_PRED_AS_OBS={self.ASYNC_PRED_AS_OBS} ASYNC_FALLBACK_SQ_THRESH={self.ASYNC_FALLBACK_SQ_THRESH}")
 
     def _split_pred_composite(self, composite, target_h, target_w):
         """Split a (H_comp, W_comp, 3) pred composite back into 3 camera views.
@@ -202,20 +286,12 @@ class DreamZeroPolicy(BasePolicy):
     def _save_truth_video(self, policy_obs, filename, label="T"):
         """Save the 3-camera buffer in policy_obs as a 2x2 composite mp4 that
         mirrors the model's _prepare_video DROID layout (wrist top stretched,
-        left+right exterior bottom). Handles both 4D (multi-frame) and 3D
-        (single-frame, after short-buffer fallback) inputs."""
+        left+right exterior bottom)."""
         try:
             left_ext = policy_obs.get("video.exterior_image_1_left")
             right_ext = policy_obs.get("video.exterior_image_2_left")
             wrist = policy_obs.get("video.wrist_image_left")
-            if left_ext is None:
-                return
-            if left_ext.ndim == 3:
-                # Single-frame mode: lift to (T=1, H, W, 3)
-                left_ext = left_ext[None]
-                right_ext = right_ext[None]
-                wrist = wrist[None]
-            elif left_ext.ndim != 4:
+            if left_ext is None or left_ext.ndim != 4:
                 return
             T, H, W, _ = left_ext.shape
             comp = np.zeros((T, 2 * H, 2 * W, 3), dtype=np.uint8)
@@ -259,25 +335,13 @@ class DreamZeroPolicy(BasePolicy):
             return None
 
     def _swap_latest_to_pred(self, policy_obs, pred_composite):
-        """Return a new policy_obs dict where the video buffer's "current" entry
-        is replaced with pred_composite (split per camera).
-
-        Two cases:
-          - 4D buffer (multi-frame, T>=1): SHIFT LEFT by 1, append pred at end.
-            Keeps adjacent entries 1-chunk apart so VAE temporal compression
-            doesn't see a spurious "acceleration".
-          - 3D buffer (single-frame fallback after short-buffer): replace the
-            single frame entirely with split pred.
-        """
+        """Legacy single-frame swap. Superseded by `_build_b_obs_from_pred` for
+        the two-step pipeline (which now feeds B the full 9-frame decoded
+        prediction). Kept for backward compatibility / experimentation."""
         ref = policy_obs["video.exterior_image_1_left"]
-        if ref.ndim == 4 and ref.shape[0] >= 1:
-            tgt_h, tgt_w = ref.shape[1], ref.shape[2]
-            mode = "multi"
-        elif ref.ndim == 3:
-            tgt_h, tgt_w = ref.shape[0], ref.shape[1]
-            mode = "single"
-        else:
+        if ref.ndim != 4 or ref.shape[0] < 1:
             return policy_obs
+        tgt_h, tgt_w = ref.shape[1], ref.shape[2]
         split = self._split_pred_composite(pred_composite, tgt_h, tgt_w)
         mapping = {
             "video.exterior_image_1_left":  split["observation/exterior_image_0_left"],
@@ -286,11 +350,8 @@ class DreamZeroPolicy(BasePolicy):
         }
         new_obs = dict(policy_obs)
         for k, frame in mapping.items():
-            if mode == "multi":
-                stacked = new_obs[k]
-                new_obs[k] = np.concatenate([stacked[1:], frame[None]], axis=0)
-            else:  # single
-                new_obs[k] = frame
+            stacked = new_obs[k]
+            new_obs[k] = np.concatenate([stacked[1:], frame[None]], axis=0)
         # Optional debug dump
         if os.environ.get("DUMP_SPLIT_PRED", "0") == "1":
             try:
@@ -302,6 +363,88 @@ class DreamZeroPolicy(BasePolicy):
                     imageio.imwrite(os.path.join(debug_dir, f"chunk{idx:05d}_{k.replace('.', '_')}.png"), img)
             except Exception as e:
                 logger.warning(f"[DUMP_SPLIT_PRED] failed: {e}")
+        return new_obs
+
+    def _decode_pred_to_frames(self, video_pred):
+        """Decode a VAE latent to a (T, H_comp, W_comp, 3) uint8 ndarray.
+        T is the model's native temporal output (typically 9 raw frames per
+        chunk). Returns None on failure."""
+        if video_pred is None:
+            return None
+        try:
+            action_head = self.policy.trained_model.action_head
+            with torch.no_grad():
+                frames = action_head.vae.decode(
+                    video_pred,
+                    tiled=action_head.tiled,
+                    tile_size=(action_head.tile_size_height, action_head.tile_size_width),
+                    tile_stride=(action_head.tile_stride_height, action_head.tile_stride_width),
+                )
+            frames = rearrange(frames, "B C T H W -> B T H W C")
+            return ((frames[0].float() + 1) * 127.5).clamp(0, 255).cpu().numpy().astype(np.uint8)
+        except Exception as e:
+            logger.warning(f"[decode pred] failed: {e}")
+            return None
+
+    def _build_b_obs_from_pred(self, policy_obs_a, pred_a):
+        """Construct B's policy_obs by replacing the entire video time axis with
+        A's full decoded prediction (typically 9 frames per camera). The state
+        and language fields are inherited from A's policy_obs.
+
+        Rationale: A's prediction represents one whole chunk of execution
+        (9 raw frames / 3 motion latents). Reusing only `pred_A_last` (the
+        legacy `_swap_latest_to_pred` behaviour) compresses 1 chunk's worth of
+        information into 1 buffer slot. Feeding the full 9 frames lets the
+        action_head go through its native shape[2]==9 path (skipping the
+        repeat_interleave that shape[2]==4 would trigger), preserving all of
+        A's predicted motion as B's "observed" chunk.
+
+        Accepts both ndim=3 (single-frame, e.g. chunk 1 boundary where A
+        degraded to 1-frame) and ndim=4 (multi-frame) policy_obs_a. In both
+        cases B receives the full decoded prediction (9 frames)."""
+        ref = policy_obs_a.get("video.exterior_image_1_left")
+        if ref is None:
+            return policy_obs_a
+        if ref.ndim == 4:
+            tgt_h, tgt_w = ref.shape[1], ref.shape[2]
+        elif ref.ndim == 3:
+            tgt_h, tgt_w = ref.shape[0], ref.shape[1]
+        else:
+            return policy_obs_a
+
+        composite_frames = self._decode_pred_to_frames(pred_a)
+        if composite_frames is None or composite_frames.shape[0] < 1:
+            logger.warning("[B obs] decode failed, falling back to A obs unchanged")
+            return policy_obs_a
+
+        # Split each composite frame per-camera; stack along time axis.
+        per_cam = {
+            "video.exterior_image_1_left":  [],
+            "video.exterior_image_2_left":  [],
+            "video.wrist_image_left":       [],
+        }
+        for f in composite_frames:
+            split = self._split_pred_composite(f, tgt_h, tgt_w)
+            per_cam["video.exterior_image_1_left"].append(split["observation/exterior_image_0_left"])
+            per_cam["video.exterior_image_2_left"].append(split["observation/exterior_image_1_left"])
+            per_cam["video.wrist_image_left"].append(split["observation/wrist_image_left"])
+
+        new_obs = dict(policy_obs_a)
+        for k, frames_list in per_cam.items():
+            new_obs[k] = np.stack(frames_list, axis=0)  # (T=9, H, W, 3)
+
+        if os.environ.get("DUMP_SPLIT_PRED", "0") == "1":
+            try:
+                debug_dir = os.path.join(self.video_out_dir, "split_debug")
+                os.makedirs(debug_dir, exist_ok=True)
+                idx = self._infer_count
+                for t, f in enumerate(composite_frames):
+                    imageio.imwrite(
+                        os.path.join(debug_dir, f"chunk{idx:05d}_compositeT{t:02d}.png"), f
+                    )
+            except Exception as e:
+                logger.warning(f"[DUMP_SPLIT_PRED] failed: {e}")
+
         return new_obs
 
     def _build_policy_obs(self, obs: dict):
@@ -320,22 +463,44 @@ class DreamZeroPolicy(BasePolicy):
             gp = gp[np.newaxis, :]
 
         # Reset buffers on episode boundary (client sends reset_episode=True at chunk 0)
-        if obs.get("reset_episode", False):
+        # OR on server-side pending reset (fallback triggered last chunk → behave
+        # exactly like chunk 0: empty buffers, single-frame, lag bypassed for this call).
+        is_fresh_start = False
+        if obs.get("reset_episode", False) or self._pending_reset:
             for k in self._frame_buffers:
                 self._frame_buffers[k].clear()
             for k in self._state_buffers:
                 self._state_buffers[k].clear()
             self._is_first_call = True
             self._last_pred_composite = None
+            if self._pending_reset:
+                is_fresh_start = True
+                self._pending_reset = False
+                logger.info("[pending_reset] consumed: this chunk treated as fresh chunk-0 (no lag, single-frame)")
 
-        # Append latest frame from each camera
+        # Append latest frame from each camera. Mirrors clean's
+        # socket_test_optimized_AR.py:120-125: ndim=4 obs (multi-frame batch
+        # from a single chunk window) gets `extend`ed; ndim=3 single frame
+        # gets `append`ed.
         cam_inputs = {
             "video.exterior_image_1_left":  obs["observation/exterior_image_0_left"],
             "video.exterior_image_2_left":  obs["observation/exterior_image_1_left"],
             "video.wrist_image_left":       obs["observation/wrist_image_left"],
         }
-        for k, img in cam_inputs.items():
-            self._frame_buffers[k].append(img)
+        for k, data in cam_inputs.items():
+            if isinstance(data, np.ndarray) and data.ndim == 4:
+                if is_fresh_start:
+                    # Post-pause restart: behave exactly like chunk 0 — push
+                    # only the most recent frame (offset 0) so buf_len=1 and
+                    # `do_async_two_step` (which requires buf_len>1) skips the
+                    # A+B two-step path. Avoids B's shift/scale dance on a
+                    # state with no real history; single forward pass on the
+                    # current frame gives a clean K=0-like action chunk.
+                    self._frame_buffers[k].append(data[-1])
+                else:
+                    self._frame_buffers[k].extend(list(data))
+            else:
+                self._frame_buffers[k].append(data)
         self._state_buffers["jp"].append(jp)
         self._state_buffers["gp"].append(gp)
 
@@ -348,24 +513,31 @@ class DreamZeroPolicy(BasePolicy):
 
         buf_len = len(self._frame_buffers["video.exterior_image_1_left"])
 
-        # _build_policy_obs always produces SYNC-style obs (latest real at [-1]).
-        # ASYNC_PRED_AS_OBS=1 is handled at the handler level via 2-step inference
-        # (run sync to get fresh pred_A, then re-run with pred_A_last at [-1]).
-        # ASYNC_LAG_CHUNKS=N still applies as a naive baseline (drop latest N obs).
+        # ASYNC_LAG_CHUNKS=N means "skip the most recent N chunks' worth of
+        # frames" (= N * num_frames buffer entries since each non-first chunk
+        # extends num_frames frames per push). This matches true-async
+        # semantics: inference K starts at T_{K-1} and cannot see frames
+        # captured DURING chunk K-1's execution (the most recent push to the
+        # buffer). Chunk K=lag is the boundary: the lagged window points
+        # before any 4-frame push existed (only chunk 0's single reset frame
+        # is in range). Padding by repeating buf[0] would create a 4-frame
+        # static buffer that's out-of-distribution for the model. Instead,
+        # degrade to 1-frame mode using buf[0] (chunk 0's reset frame) — this
+        # mirrors sync chunk 0's input exactly, which is the natural
+        # interpretation of "K chunks ago = chunk 0's reset state".
         lag = self.ASYNC_LAG_CHUNKS
-
-        # Short-buffer fallback (only in ASYNC_PRED_AS_OBS mode): when buf has
-        # fewer than num_frames+lag entries the slicing+padding produces an OOD
-        # buffer (mostly identical T_0). Forward A on that input falls outside
-        # the model's training distribution. Fall back to single-frame mode
-        # (num_frames=1) — same path as sync chunk 0, in-distribution.
-        if (self.ASYNC_PRED_AS_OBS == 1 and num_frames > 1
-                and buf_len < num_frames + lag):
-            num_frames = 1
-
-        if lag > 0 and buf_len > lag:
-            window_end = -lag
-            window_start = window_end - num_frames
+        lag_entries = lag * num_frames
+        if not is_fresh_start and lag > 0 and buf_len > lag_entries:
+            if lag_entries + num_frames > buf_len:
+                # Underflow at the chunk-K=lag boundary: not enough history
+                # for `num_frames` distinct lagged frames. Degrade to 1-frame
+                # at buf[0] (= the reset frame).
+                num_frames = 1
+                window_start = 0
+                window_end = 1
+            else:
+                window_end = -lag_entries
+                window_start = window_end - num_frames
         else:
             window_end = None
             window_start = -num_frames
@@ -381,9 +553,12 @@ class DreamZeroPolicy(BasePolicy):
                     frames.insert(0, sliced[0] if sliced else buf[0])
             videos[k] = np.stack(frames, axis=0) if num_frames > 1 else frames[0]
 
+        # State buffer stores 1 jp/gp per server call (regardless of how many
+        # frames were extended). So "lag N chunks" for state = N entries from
+        # the end. state_buf[-(lag+1)] gives jp/gp at chunk K-lag's start.
         if window_end is not None:
-            jp_send = self._state_buffers["jp"][window_end - 1]
-            gp_send = self._state_buffers["gp"][window_end - 1]
+            jp_send = self._state_buffers["jp"][-(lag + 1)]
+            gp_send = self._state_buffers["gp"][-(lag + 1)]
         else:
             jp_send = jp
             gp_send = gp
@@ -499,7 +674,14 @@ class DreamZeroPolicy(BasePolicy):
         if obs.get("reset_episode", False):
             self._last_video_pred = None
             self._last_pred_composite = None
-            logger.info("[reset_episode] Cleared _last_video_pred for new episode")
+            self._pending_actions = None
+            self._pending_video_pred = None
+            self._prev_applied_last = None
+            self._prev_applied_full = None
+            self._prev_applied_last_gripper = None
+            self._two_step_count_since_pause = 0
+            self._pending_grip_pause = False
+            logger.info("[reset_episode] Cleared _last_video_pred + queue for new episode")
 
         # Allow client to switch output directory per run without restarting server
         if "output_dir" in obs and obs["output_dir"] != self.video_out_dir:
@@ -529,40 +711,268 @@ class DreamZeroPolicy(BasePolicy):
         t_async = time.perf_counter()
 
         # ASYNC_PRED_AS_OBS=1: 2-step inference per chunk.
-        #   A) Run sync forward on real-obs buffer → pred_A (fresh lookahead).
-        #   B) Replace [-1] of buffer with pred_A's last decoded frame (split per
-        #      camera) → run forward again → pred_B + actions to send.
-        # Pred_A is always FRESH from current real obs each chunk (no chaining
-        # of pred → pred → pred which would compound errors).
-        # Falls back to sync on chunk 0 (buffer too short to be meaningful).
+        #   A) Run forward on the LAGGED real-obs window — i.e. the same input
+        #      sync chunk K-1 would have consumed. With ASYNC_LAG_CHUNKS=1, A_K
+        #      mirrors sync chunk K-1 (chunk-1 boundary degrades to 1-frame
+        #      buf[0] = reset frame, matching sync chunk 0 exactly). pred_A is
+        #      always anchored on real obs so chaining doesn't compound.
+        #   B) Replace the entire video time axis with A's full 9-frame decoded
+        #      prediction (per-camera split). Re-run forward → pred_B + actions
+        #      to apply. Model takes shape[2]==9 directly (skips the 4→9
+        #      repeat_interleave path used for 4-frame input).
+        # Falls back to single sync forward on chunk 0 (buffer too short to be
+        # meaningful — only the reset frame in buf).
         do_async_two_step = (self.ASYNC_PRED_AS_OBS == 1
                              and len(self._frame_buffers["video.exterior_image_1_left"]) > 1)
 
         two_step_did_run = False
         if do_async_two_step:
-            # Save forward A's input buffer (9 real obs) as "I" labeled composite.
+            # Step A uses the lagged real-obs window (= policy_obs from the
+            # earlier _build_policy_obs(obs) call). At chunk 1 boundary this
+            # is 1-frame buf[0]; at K≥2 it's chunk K-1's 4-frame push.
             self._save_truth_video(
                 policy_obs, f"pred_{self._infer_count:05d}_I.mp4", label="I"
             )
-            # --- Step A: sync inference for fresh lookahead ---
             result_A, pred_A = self._run_forward(policy_obs)
-            # Save pred_A video with "A" label and pred_A's action set with _A suffix.
             pred_A_last = self._save_pred_video_named(
                 pred_A, f"pred_{self._infer_count:05d}_A.mp4", label="A"
             )
             actions_A = self._extract_actions(result_A)
             self._save_actions(actions_A, idx=self._infer_count, suffix="_A")
             self._last_pred_composite = pred_A_last  # debug visibility
-            # --- Step B: re-inference with pred_A_last replacing [-1] ---
-            policy_obs_async = self._swap_latest_to_pred(policy_obs, pred_A_last)
-            # Save forward B's input buffer with "J" label for analysis
-            # (= I shifted left by 1 + pred_A_last appended at end).
+
+            # Step B feeds A's full 9-frame decoded prediction (regardless of
+            # A's input shape — even when A used 1-frame at chunk 1, its
+            # decoded output is still 9 frames, suitable for B's shape[2]==9
+            # path).
+            policy_obs_B = self._build_b_obs_from_pred(policy_obs, pred_A)
             self._save_truth_video(
-                policy_obs_async, f"pred_{self._infer_count:05d}_J.mp4", label="J"
+                policy_obs_B, f"pred_{self._infer_count:05d}_J.mp4", label="J"
             )
-            result_batch, video_pred = self._run_forward(policy_obs_async)
+            result_B, pred_B = self._run_forward(policy_obs_B)
+            actions_B = self._extract_actions(result_B)
+            # Save raw B (model output before shift / amplitude scaling) for
+            # offline diagnostics. shift/scale only modify joints 0..6 (gripper
+            # is always passed through), so raw B differs from applied B in
+            # joint values only.
+            self._save_actions(actions_B, idx=self._infer_count, suffix="_B_raw")
             two_step_did_run = True
-            logger.info("[async_two_step] step A (sync→pred_A) + step B (pred_A→final) done")
+
+            # Distill VAE-bias correction: learned residual replaces PD1.
+            # Input: (B_raw, B_prev_applied, A_K) channel-concat → (24, 24)
+            # Output: residual (24, 7) added to B_raw joints. Set B_PREV_DIFF_ALPHA=0
+            # when using distill to avoid double-correction.
+            if (self._distill_model is not None
+                    and self._prev_applied_full is not None
+                    and self._prev_applied_full.shape == actions_B.shape):
+                with torch.no_grad():
+                    x = np.concatenate(
+                        [actions_B[:, :8], self._prev_applied_full[:, :8], actions_A[:, :8]],
+                        axis=1
+                    ).astype(np.float32)
+                    x_t = torch.from_numpy(x).unsqueeze(0)
+                    residual = self._distill_model(x_t).squeeze(0).numpy()
+                actions_B[:, :7] += residual
+                logger.info(
+                    f"[distill] residual applied; max|res|={float(np.abs(residual).max()):.4f}"
+                )
+
+            # B-action shift correction: B's input is A's video latent round-tripped
+            # through VAE.decode → split → resize → VAE.encode. The action head was
+            # never trained on this re-encoded distribution, so it produces an OOD
+            # per-chunk constant bias (often inducing odd/even oscillation in the
+            # executed trajectory). The relative motion inside B is fine, so we
+            # translate B's first 7 joints as a whole, preserving B's internal delta.
+            # Anchor target: last command we issued at the previous chunk
+            # (_prev_applied_last). This is the cleanest async-legal approximation
+            # of "where the robot is at chunk K start" — A_K[-1] would also work but
+            # is already used by B_PREV_DIFF_ALPHA, so reusing it would double-count
+            # A's information. Fall back to A_K[-1] only when no prev-chunk action
+            # exists (shouldn't happen for two-step path; defensive).
+            if self._prev_applied_last is not None:
+                anchor_j = self._prev_applied_last
+            else:
+                anchor_j = actions_A[-1, :7]
+            shift_j = anchor_j - actions_B[0, :7]
+            actions_B_shifted = actions_B.copy()
+            actions_B_shifted[:, :7] += shift_j
+
+            # B amplitude scaling: B tends to be too flat within a chunk (per-chunk
+            # range ~50-80% of A's). Stretch each joint's deviation from B[0] by the
+            # ratio of slopes at the K-1/K boundary: scale_j = vA / vB where
+            # vA = A[-1,j]-A[-2,j] (A's last-step velocity, end of chunk K-1) and
+            # vB = B[1,j]-B[0,j] (B's first-step velocity, start of chunk K). Negative
+            # scale means a sign flip; we accept it (per user). Cap the resulting
+            # delta from B[0] to A's chunk range so B can't be wilder than A.
+            if self.B_AMPLITUDE_SCALE == 1:
+                W = max(1, min(self.B_AMPLITUDE_SCALE_WINDOW, actions_A.shape[0] - 1))
+                scaled_log = []
+                for j in range(7):
+                    vA = float(actions_A[-1, j] - actions_A[-1 - W, j])
+                    vB = float(actions_B[W, j]   - actions_B[0, j])
+                    if abs(vB) < 1e-9:
+                        scale_j = 1.0
+                    else:
+                        scale_j = vA / vB
+                    A_range = float(actions_A[:, j].max() - actions_A[:, j].min())
+                    delta = (actions_B[:, j] - actions_B[0, j]) * scale_j
+                    delta = np.clip(delta, -A_range, A_range)
+                    actions_B_shifted[:, j] = actions_B_shifted[0, j] + delta
+                    scaled_log.append((scale_j, A_range))
+                logger.info(
+                    f"[B_amp_scale] W={W} scales={[round(s[0], 2) for s in scaled_log]}, "
+                    f"A_ranges={[round(s[1], 3) for s in scaled_log]}"
+                )
+
+            # B_PREV_DIFF_ALPHA: residual VAE-bias correction (shape-only).
+            # A_K and B_{K-1} both predict chunk K-1's window. Their diff is
+            # the VAE round-trip bias observed last chunk. We subtract delta[0]
+            # from every step so PD1 contributes 0 at t=0 → anchor=B_{K-1}[-1]
+            # is preserved at step 0 (no double-counting of A's information).
+            # PD1 only carries the per-step shape difference.
+            if (self.B_PREV_DIFF_ALPHA > 0.0
+                    and self._prev_applied_full is not None
+                    and self._prev_applied_full.shape[0] == actions_A.shape[0]):
+                delta = actions_A[:, :7] - self._prev_applied_full[:, :7]
+                delta = delta - delta[0:1, :]  # zero PD1 at t=0
+                actions_B_shifted[:, :7] += self.B_PREV_DIFF_ALPHA * delta
+                logger.info(
+                    f"[B_prev_diff] alpha={self.B_PREV_DIFF_ALPHA} (shape-only, t=0 zeroed) "
+                    f"delta_max={float(np.abs(delta).max()):.4f} "
+                    f"delta_mean_per_j={[round(float(delta[:, j].mean()), 4) for j in range(7)]}"
+                )
+
+            # Fallback metric: how badly does A_K's start disagree with the
+            # last applied chunk's end? Large value => B's OOD bias likely too
+            # severe for shift to fix. In that case, drop B and use A_K
+            # directly (lagged real-obs prediction, no round-trip OOD).
+            fallback_triggered = False
+            fallback_sq = 0.0
+            if self._prev_applied_last is not None:
+                diff = actions_A[0, :7] - self._prev_applied_last
+                fallback_sq = float(np.sum(diff * diff))
+                if fallback_sq > self.ASYNC_FALLBACK_SQ_THRESH:
+                    fallback_triggered = True
+
+            # FORCE_PAUSE_EVERY_N override: ignore the metric, force pause on a
+            # fixed cadence (every N two-step entries since last pause).
+            self._two_step_count_since_pause += 1
+            forced_pause = (
+                self.FORCE_PAUSE_EVERY_N > 0
+                and self._two_step_count_since_pause >= self.FORCE_PAUSE_EVERY_N
+            )
+            # Grip-transition forced pause: previous chunk grasped the object,
+            # this chunk is forced to pause to let sim settle + give next chunk
+            # fresh post-grasp real obs (chunk-0-like).
+            if self._pending_grip_pause:
+                forced_pause = True
+                self._pending_grip_pause = False
+                logger.info("[grip_pause] forcing pause this chunk (gripper closed in previous chunk)")
+            # Grip-pre pause: A predicts chunk K-1 with real obs; if A says
+            # "should have grasped" anywhere in chunk K-1 but actual previous
+            # B (executed) didn't grasp → A is reporting a missed grasp. Pause
+            # this chunk and re-plan from fresh obs to prevent error buildup.
+            # Use A's MAX gripper across the chunk (not just last) because the
+            # model's gripper close signal can be in the middle of the chunk.
+            if (self.GRIP_PRE_PAUSE
+                    and self._prev_applied_last_gripper is not None
+                    and self._prev_applied_last_gripper <= 0.5):
+                A_g_max = float(actions_A[:, 7].max())
+                if A_g_max > 0.5:
+                    forced_pause = True
+                    A_g_argmax = int(actions_A[:, 7].argmax())
+                    logger.info(
+                        f"[grip_pre_pause] A_K says should-have-grasped at step "
+                        f"{A_g_argmax} (gripper={A_g_max:.3f}) but prev_applied "
+                        f"ended open ({self._prev_applied_last_gripper:.3f}) "
+                        f"→ pausing this chunk to fix"
+                    )
+            # B-abort: if current chunk's B raw plan contains open→close grasp
+            # transition, abort this two-step chunk. Grasping should only be
+            # performed by post-pause chunk-0-like sync, never by async two-step.
+            if (self.GRIP_B_ABORT
+                    and float(actions_B[0, 7]) <= 0.5
+                    and float(actions_B[-1, 7]) > 0.5):
+                forced_pause = True
+                logger.info(
+                    f"[grip_b_abort] B plans open→close in two-step "
+                    f"(B[0,7]={float(actions_B[0,7]):.3f}, "
+                    f"B[-1,7]={float(actions_B[-1,7]):.3f}) "
+                    f"→ aborting; let next post-pause sync handle grasp"
+                )
+            if forced_pause:
+                fallback_triggered = True
+
+            logger.info(
+                f"[async_two_step] step A + step B done; "
+                f"shift |max|={float(np.abs(shift_j).max()):.4f}; "
+                f"fallback_sq={fallback_sq:.4f} "
+                f"(thresh={self.ASYNC_FALLBACK_SQ_THRESH}, triggered={fallback_triggered}"
+                f"{', FORCED' if forced_pause else ''})"
+            )
+
+            if fallback_triggered:
+                # PAUSE: drop both A and B, emit 24 hold-still actions
+                # (current jp/gp tiled), and reset server state so the next
+                # chunk runs single-frame from the now-static sim. Sim's joint
+                # PD controller treats target == current as "stay put"; gripper
+                # threshold (>0.2) keeps current open/closed state. KV cache is
+                # reset every chunk by FORCE_RESET_EVERY_CHUNK=1, so no extra
+                # work needed there.
+                hold_jp = obs["observation/joint_position"]
+                hold_gp = obs["observation/gripper_position"]
+                hold_jp = np.asarray(hold_jp, dtype=np.float32).reshape(-1)[:7]
+                hold_gp = np.asarray(hold_gp, dtype=np.float32).reshape(-1)[:1]
+                # Snap hold_gp to 0.0 or 1.0 to avoid obs-noise + binarize-threshold
+                # interaction. Threshold 0.3 keeps partial grip (obs ~0.35) as
+                # "closed" — preserves the held object across pause chunks.
+                hold_gp = np.where(hold_gp > 0.3, 1.0, 0.0).astype(np.float32)
+                hold_step = np.concatenate([hold_jp, hold_gp])  # (8,)
+                H_actions = actions_A.shape[0] if actions_A is not None else 24
+                actions_override = np.tile(hold_step[None, :], (H_actions, 1)).astype(np.float32)
+                # Buffers / queue / pred-cache cleared; pending_reset makes the
+                # next chunk's _build_policy_obs behave like reset_episode=True.
+                for k in self._frame_buffers:
+                    self._frame_buffers[k].clear()
+                for k in self._state_buffers:
+                    self._state_buffers[k].clear()
+                self._is_first_call = True
+                self._last_pred_composite = None
+                self._last_video_pred = None
+                self._pending_actions = None
+                self._pending_video_pred = None
+                self._pending_reset = True
+                self._two_step_count_since_pause = 0
+                # _prev_applied_last will be re-set below from the hold-still actions
+                # so the next chunk's fallback metric compares against the static pose.
+                result_batch = result_B
+                # Keep B's prediction video for *saving* (diagnostics) but DON'T
+                # carry it forward as next-chunk's video latent context.
+                video_pred = pred_B
+                video_pred_no_carry = True
+                logger.info(
+                    f"[async_two_step] FALLBACK PAUSE: emitting {H_actions} hold-still "
+                    f"actions (jp={hold_jp.tolist()}, gp={float(hold_gp[0]):.3f}); "
+                    f"buffers cleared, next chunk = fresh chunk-0"
+                )
+            elif self.ASYNC_QUEUE == 1:
+                if self._pending_actions is not None:
+                    actions_override = self._pending_actions
+                    video_pred_override = self._pending_video_pred
+                    logger.info("[async_queue] applied queued B from previous chunk")
+                else:
+                    actions_override = actions_A
+                    video_pred_override = pred_A
+                    logger.info("[async_queue] no pending yet → using A this chunk")
+                self._pending_actions = actions_B_shifted
+                self._pending_video_pred = pred_B
+                result_batch = result_B
+                video_pred = video_pred_override
+            else:
+                # Legacy QUEUE=0 + shift correction.
+                actions_override = actions_B_shifted
+                result_batch = result_B
+                video_pred = pred_B
         elif predicted_mode and self._last_video_pred is not None:
             # === Predicted mode: use latent_video at non-reset chunks ===
             # At csf=0 (reset), pass None so real observation is used (static frame).
@@ -574,17 +984,69 @@ class DreamZeroPolicy(BasePolicy):
                 logger.info(f"[predicted] Using latent_video (csf={ah.current_start_frame})")
             else:
                 logger.info(f"[predicted] Reset chunk (csf={ah.current_start_frame}), using real obs")
+            self._save_truth_video(
+                policy_obs, f"pred_{self._infer_count:05d}_I.mp4", label="I"
+            )
             result_batch, video_pred = self._run_forward(policy_obs, latent_video=lv)
         else:
             # === Sync mode (default): use real obs ===
+            self._save_truth_video(
+                policy_obs, f"pred_{self._infer_count:05d}_I.mp4", label="I"
+            )
             result_batch, video_pred = self._run_forward(policy_obs)
 
-        actions = self._extract_actions(result_batch)
+        # If two_step ran, actions_override holds the to-apply commands
+        # (shifted B for QUEUE=0, queued shifted B / A_K fallback for QUEUE=1).
+        # Otherwise extract raw from result_batch.
+        if two_step_did_run and 'actions_override' in locals() and actions_override is not None:
+            actions = actions_override
+        else:
+            actions = self._extract_actions(result_batch)
+
+        if (self.RELATIVE_ACTION_SCALE != 1.0
+                and actions is not None and actions.shape[-1] >= 7):
+            current_jp = np.asarray(policy_obs["state.joint_position"], dtype=actions.dtype).reshape(1, -1)[:, :7]
+            actions[:, :7] = current_jp + self.RELATIVE_ACTION_SCALE * (actions[:, :7] - current_jp)
+
+        # Update _prev_applied_last for next chunk's fallback metric and
+        # _prev_applied_full for B_PREV_DIFF_ALPHA correction. When pause is
+        # pending (next chunk = chunk-0-like), clear full so the diff doesn't
+        # carry across a discontinuity.
+        if actions is not None and actions.shape[-1] >= 7:
+            self._prev_applied_last = actions[-1, :7].copy()
+            if actions.shape[-1] >= 8:
+                self._prev_applied_last_gripper = float(actions[-1, 7])
+            if self._pending_reset:
+                self._prev_applied_full = None
+            else:
+                self._prev_applied_full = actions.copy()
+
+        # Detect open→closed gripper transition within this chunk. If the
+        # gripper command starts open (<=0.2) and ends closed (>0.2), the
+        # grasp happens during this chunk → force a pause on the next chunk.
+        # Skip if this chunk was a fallback hold-still (gripper constant).
+        if (self.GRIP_TRANSITION_PAUSE
+                and actions is not None and actions.shape[-1] >= 8
+                and not self._pending_reset):
+            g_first = float(actions[0, 7])
+            g_last = float(actions[-1, 7])
+            if g_first <= 0.5 < g_last:
+                self._pending_grip_pause = True
+                logger.info(
+                    f"[grip_pause] open→closed detected this chunk "
+                    f"(first={g_first:.3f}, last={g_last:.3f}); "
+                    f"next chunk will be forced to pause"
+                )
 
         t_forward = time.perf_counter()
 
-        # Save video_pred for next chunk
-        self._last_video_pred = video_pred
+        # Save video_pred for next chunk's latent context.
+        # On fallback pause, video_pred_no_carry was set so we keep `video_pred`
+        # for *saving* (diagnostics) but don't carry it across the pause.
+        if 'video_pred_no_carry' in locals() and video_pred_no_carry:
+            self._last_video_pred = None
+        else:
+            self._last_video_pred = video_pred
 
         # Decode and save AI prediction video. In 2-step async mode, save the
         # final (B) under the canonical pred_NNNNN.mp4 name with a "B" label;
